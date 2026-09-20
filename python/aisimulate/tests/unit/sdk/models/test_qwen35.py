@@ -582,3 +582,341 @@ def test_qwen38max_memory_charges_kv_on_full_layers_and_constant_gdn_state(
     per_token_bytes = 2 * expected_elements_per_token  # bf16 kvcache
     assert model.get_kvcache_bytes_per_sequence(4096) == 4096 * per_token_bytes + expected_state_bytes
     assert model.get_kvcache_max_tokens(expected_state_bytes + 100 * per_token_bytes) == 100
+
+
+# Qwen/Qwen3.6-35B-A3B-FP8 ``quantization_config.modules_to_not_convert``
+# (native fp8_block, no hf_quant_config), per-layer entries collapsed to
+# layer 0 and the visual tower omitted: only norms, the router, the scalar
+# shared-expert gate and the non-GEMM GDN parameters are kept in BF16.
+_QWEN36_FP8_EXCLUSIONS = (
+    "lm_head",
+    "model.embed_tokens",
+    "model.language_model.layers.0.input_layernorm",
+    "model.language_model.layers.0.linear_attn.A_log",
+    "model.language_model.layers.0.linear_attn.conv1d",
+    "model.language_model.layers.0.linear_attn.dt_bias",
+    "model.language_model.layers.0.linear_attn.in_proj_a",
+    "model.language_model.layers.0.linear_attn.in_proj_b",
+    "model.language_model.layers.0.linear_attn.in_proj_ba",
+    "model.language_model.layers.0.linear_attn.norm",
+    "model.language_model.layers.0.mlp.gate",
+    "model.language_model.layers.0.mlp.shared_expert_gate",
+    "model.language_model.layers.0.post_attention_layernorm",
+    "model.language_model.layers.0.self_attn.k_norm",
+    "model.language_model.layers.0.self_attn.q_norm",
+    "model.visual.blocks.0.attn.proj",
+    "model.visual.blocks.0.attn.qkv",
+    "model.visual.blocks.0.mlp.linear_fc1",
+    "model.visual.blocks.0.mlp.linear_fc2",
+    "mtp.fc",
+    "mtp.layers.0.mlp.gate",
+    "mtp.layers.0.self_attn.q_norm",
+    "mtp.norm",
+)
+
+_FP8 = common.GEMMQuantMode.fp8_block
+_BF16 = common.GEMMQuantMode.bfloat16
+
+
+def _fp8_raw_config(exclusions, *, key="modules_to_not_convert"):
+    return {"quantization_config": {"quant_method": "fp8", "fmt": "e4m3", key: list(exclusions)}}
+
+
+def _resolve_gemm_modes(exclusions, **kwargs):
+    return core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+        _fp8_raw_config(exclusions, **kwargs), _FP8, allow_checkpoint_split=True
+    )
+
+
+def test_qwen36_fp8_native_exclusions_keep_every_gemm_category_quantized():
+    # Regression: substring matching on ``linear_attn``/``self_attn``/``.mlp``
+    # demoted every projection and shared-expert GEMM to BF16 although no GEMM
+    # is excluded (the fp8_block lane was never used for this checkpoint).
+    # in_proj_a / in_proj_b ARE excluded, so the GDN b/a GEMM stays BF16.
+    assert _resolve_gemm_modes(_QWEN36_FP8_EXCLUSIONS) == (_FP8, _BF16, _FP8, _FP8)
+
+
+@pytest.mark.parametrize(
+    "exclusions",
+    [
+        ["model.language_model.layers.3.self_attn.q_proj"],
+        ["model.layers.0.linear_attn.out_proj"],
+        ["linear_attn.in_proj_qkvz"],
+        ["self_attn"],
+        ["model.language_model.layers.0.linear_attn"],
+        ["model.language_model.layers.0.self_attn*"],
+        ["layers.*.self_attn.q_proj"],
+        ["re:.*linear_attn.*"],
+    ],
+    ids=["q_proj", "out_proj", "bare_in_proj", "bare_block", "block_path", "modelopt_glob", "layer_glob", "regex"],
+)
+def test_qwen35_projection_gemm_exclusion_demotes_only_projection(exclusions):
+    # The GDN b/a GEMM follows the projection mode unless excluded on its own.
+    assert _resolve_gemm_modes(exclusions) == (_BF16, _BF16, _FP8, _FP8)
+
+
+def test_qwen35_gdn_ba_exclusion_demotes_only_the_ba_gemm():
+    assert _resolve_gemm_modes(["model.layers.0.linear_attn.in_proj_ba"]) == (_FP8, _BF16, _FP8, _FP8)
+    assert _resolve_gemm_modes(["linear_attn.in_proj_a", "linear_attn.in_proj_b"]) == (_FP8, _BF16, _FP8, _FP8)
+    assert _resolve_gemm_modes([]) == (_FP8, _FP8, _FP8, _FP8)
+
+
+@pytest.mark.parametrize(
+    "exclusions",
+    [
+        ["model.layers.0.mlp.shared_expert.down_proj"],
+        ["*.mlp.shared_expert.*"],
+        ["model.language_model.layers.0.mlp.shared_expert*"],
+    ],
+    ids=["down_proj", "glob", "modelopt_glob"],
+)
+def test_qwen35_shared_expert_gemm_exclusion_demotes_only_shared_expert(exclusions):
+    assert _resolve_gemm_modes(exclusions) == (_FP8, _FP8, _FP8, _BF16)
+
+
+def test_qwen35_shared_expert_gate_and_router_exclusions_do_not_demote_gemms():
+    # ``shared_expert_gate`` is the scalar gate, not a shared-expert GEMM;
+    # ``mlp.gate`` is the router, not a dense-FFN GEMM.
+    assert _resolve_gemm_modes(["model.layers.0.mlp.shared_expert_gate", "model.layers.0.mlp.gate"]) == (
+        _FP8,
+        _FP8,
+        _FP8,
+        _FP8,
+    )
+
+
+def test_qwen35_dense_ffn_exclusion_ignores_routed_experts():
+    assert _resolve_gemm_modes(["model.layers.0.mlp.gate_proj"], key="ignore") == (_FP8, _FP8, _BF16, _FP8)
+    assert _resolve_gemm_modes(["model.layers.0.mlp.experts.5.gate_proj", "re:.*mlp\\.experts.*"]) == (
+        _FP8,
+        _FP8,
+        _FP8,
+        _FP8,
+    )
+    # A whole-FFN exclusion covers the dense FFN and the shared expert alike.
+    assert _resolve_gemm_modes(["model.layers.0.mlp"]) == (_FP8, _FP8, _BF16, _BF16)
+
+
+@pytest.mark.parametrize(
+    "exclusions",
+    [["model.layers.0"], ["model.language_model.layers.7"], ["layers.0"], ["model.language_model.layers.0.*"]],
+    ids=["flat_literal", "nested_literal", "bare_literal", "glob"],
+)
+def test_qwen35_whole_layer_exclusion_demotes_every_category(exclusions):
+    assert _resolve_gemm_modes(exclusions) == (_BF16, _BF16, _BF16, _BF16)
+
+
+def test_qwen35_regex_exclusions_anchor_at_the_module_path_start_like_compressed_tensors():
+    # compressed-tensors applies ``re:`` patterns with ``re.match``: an
+    # unanchored router regex only covers ``mlp.gate_proj`` when it starts
+    # with ``.*`` (as it would in compressed-tensors itself).
+    assert _resolve_gemm_modes(["re:mlp\\.gate"]) == (_FP8, _FP8, _FP8, _FP8)
+    assert _resolve_gemm_modes(["re:.*mlp\\.gate$"]) == (_FP8, _FP8, _FP8, _FP8)
+    assert _resolve_gemm_modes(["re:.*mlp\\.gate"]) == (_FP8, _FP8, _BF16, _FP8)
+    assert _resolve_gemm_modes(["re:model\\.layers\\.\\d+\\.self_attn\\..*"]) == (_BF16, _BF16, _FP8, _FP8)
+
+
+def test_qwen35_bare_substring_and_parameter_exclusions_are_not_honored():
+    # Documented divergence from transformers' substring test.
+    assert _resolve_gemm_modes(["attn", "proj", "model.layers.0.self_attn.q_proj.weight"]) == (
+        _FP8,
+        _FP8,
+        _FP8,
+        _FP8,
+    )
+
+
+def test_qwen35_unrecognized_or_foreign_exclusions_do_not_demote_gemms():
+    assert _resolve_gemm_modes(
+        ["foo.bar", "mtp*", "mtp.layers.0.self_attn.q_proj", "visual.blocks.0.attn.qkv_proj"]
+    ) == (
+        _FP8,
+        _FP8,
+        _FP8,
+        _FP8,
+    )
+    assert _resolve_gemm_modes(["re:*["]) == (_FP8, _FP8, _FP8, _FP8)
+
+
+def test_qwen35_explicit_quantized_layers_override_exclusions():
+    raw_config = _fp8_raw_config(["model.language_model.layers.0.self_attn*", "*.mlp.shared_expert.*"])
+    raw_config["hf_quant_config"] = {
+        "quantization": {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.language_model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+                "model.language_model.layers.0.mlp.shared_expert.up_proj": {"quant_algo": "NVFP4"},
+            },
+        }
+    }
+    modes = core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+        raw_config, common.GEMMQuantMode.nvfp4, allow_checkpoint_split=True
+    )
+    assert modes == (
+        common.GEMMQuantMode.fp8_static,
+        common.GEMMQuantMode.fp8_static,
+        common.GEMMQuantMode.nvfp4,
+        common.GEMMQuantMode.nvfp4,
+    )
+    assert (
+        core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+            raw_config, common.GEMMQuantMode.nvfp4, allow_checkpoint_split=False
+        )
+        == (common.GEMMQuantMode.nvfp4,) * 4
+    )
+
+
+def _mixed_precision_raw_config(quantized_layers, exclusions=()):
+    raw_config = _fp8_raw_config(exclusions)
+    raw_config["hf_quant_config"] = {
+        "quantization": {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {target: {"quant_algo": algo} for target, algo in quantized_layers.items()},
+        }
+    }
+    return raw_config
+
+
+_GDN_PROJECTIONS_FP8 = {
+    "model.language_model.layers.0.linear_attn.in_proj_qkv": "FP8",
+    "model.language_model.layers.0.linear_attn.in_proj_z": "FP8",
+    "model.language_model.layers.0.linear_attn.out_proj": "FP8",
+}
+
+
+def test_qwen35_layer_map_that_enumerates_gdn_projections_without_in_proj_ab_keeps_the_ba_gemm_bf16():
+    # ModelOpt ``quantized_layers`` lists every quantized module: naming the
+    # GDN projections but neither in_proj_a/in_proj_b nor in_proj_ba means
+    # those weights are stored in BF16 even without an exclusion entry.
+    modes = core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+        _mixed_precision_raw_config(_GDN_PROJECTIONS_FP8), common.GEMMQuantMode.nvfp4, allow_checkpoint_split=True
+    )
+    assert modes == (
+        common.GEMMQuantMode.fp8_static,
+        common.GEMMQuantMode.bfloat16,
+        common.GEMMQuantMode.nvfp4,
+        common.GEMMQuantMode.nvfp4,
+    )
+    # A map that names only full-attention projections says nothing about the
+    # GDN block, so the b/a GEMM keeps following the projection mode.
+    modes = core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+        _mixed_precision_raw_config({"model.language_model.layers.3.self_attn.q_proj": "FP8"}),
+        common.GEMMQuantMode.nvfp4,
+        allow_checkpoint_split=True,
+    )
+    assert modes[:2] == (common.GEMMQuantMode.fp8_static, common.GEMMQuantMode.fp8_static)
+
+
+@pytest.mark.parametrize("ba_target", ["linear_attn.in_proj_ba", "linear_attn.in_proj_a"])
+def test_qwen35_explicit_gdn_ba_entry_is_authoritative_over_exclusions(ba_target):
+    quantized_layers = {**_GDN_PROJECTIONS_FP8, f"model.language_model.layers.0.{ba_target}": "NVFP4"}
+    exclusions = [
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+        "model.language_model.layers.0.linear_attn.in_proj_b",
+    ]
+    modes = core_models.qwen35._qwen35_mixed_precision_gemm_modes(
+        _mixed_precision_raw_config(quantized_layers, exclusions),
+        common.GEMMQuantMode.nvfp4,
+        allow_checkpoint_split=True,
+    )
+    assert modes[:2] == (common.GEMMQuantMode.fp8_static, common.GEMMQuantMode.nvfp4)
+
+
+@pytest.mark.parametrize(
+    "hf_id,default,expected",
+    [
+        ("Qwen/Qwen3.5-27B", _BF16, (_BF16, _BF16, _BF16, _BF16)),
+        ("Qwen/Qwen3.5-35B-A3B", _BF16, (_BF16, _BF16, _BF16, _BF16)),
+        ("Qwen/Qwen3.5-122B-A10B", _BF16, (_BF16, _BF16, _BF16, _BF16)),
+        ("Qwen/Qwen3.5-397B-A17B", _BF16, (_BF16, _BF16, _BF16, _BF16)),
+        # Whole-block ``layers.N.linear_attn*`` / ``self_attn*`` /
+        # ``mlp.shared_expert*`` globs keep projections and shared experts BF16.
+        (
+            "nvidia/Qwen3.5-122B-A10B-NVFP4",
+            common.GEMMQuantMode.nvfp4,
+            (_BF16, _BF16, common.GEMMQuantMode.nvfp4, _BF16),
+        ),
+        (
+            "nvidia/Qwen3.5-397B-A17B-NVFP4",
+            common.GEMMQuantMode.nvfp4,
+            (_BF16, _BF16, common.GEMMQuantMode.nvfp4, _BF16),
+        ),
+        # ModelOpt MIXED_PRECISION maps: FP8 projections, W4A16 NVFP4 FFN, and
+        # in_proj_a/in_proj_b absent from ``quantized_layers`` (stored BF16).
+        (
+            "nvidia/Qwen3.6-27B-NVFP4",
+            common.GEMMQuantMode.nvfp4,
+            (common.GEMMQuantMode.fp8_static, _BF16, common.GEMMQuantMode.w4a16_nvfp4, common.GEMMQuantMode.nvfp4),
+        ),
+        (
+            "nvidia/Qwen3.6-35B-A3B-NVFP4",
+            common.GEMMQuantMode.nvfp4,
+            (common.GEMMQuantMode.fp8_static, _BF16, common.GEMMQuantMode.nvfp4, common.GEMMQuantMode.w4a16_nvfp4),
+        ),
+        ("Qwen/Qwen3.8-2.4T-A95B", _BF16, (_BF16, _BF16, _BF16, _BF16)),
+        # Explicit q/k/v/o, in_proj_*, out_proj and shared_expert.* exclusions;
+        # the only ``.mlp`` exclusions are the router and the shared expert, so
+        # dense_ffn stays fp8_block (inert: dense FFN ops exist only for num_experts == 0).
+        ("Qwen/Qwen3.8-2.4T-A95B-FP8", _FP8, (_BF16, _BF16, _FP8, _BF16)),
+    ],
+)
+def test_bundled_qwen_configs_resolve_expected_gemm_modes(hf_id, default, expected):
+    raw_config = core_models._get_model_info(hf_id)["raw_config"]
+    assert (
+        core_models.qwen35._qwen35_mixed_precision_gemm_modes(raw_config, default, allow_checkpoint_split=True)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("hf_id", ["nvidia/Qwen3.6-27B-NVFP4", "nvidia/Qwen3.6-35B-A3B-NVFP4"])
+def test_qwen36_nvfp4_checkpoints_price_the_gdn_ba_gemm_in_bf16(hf_id):
+    model_config = sdk_config.ModelConfig(
+        tp_size=4,
+        pp_size=1,
+        moe_tp_size=4,
+        moe_ep_size=1,
+        attention_dp_size=1,
+        gemm_quant_mode=common.GEMMQuantMode.nvfp4,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+    )
+    model_config._gemm_quant_mode_is_explicit = False
+    model = models.get_model(hf_id, model_config, "trtllm")
+    by_name = {op._name: op for op in _flatten_ops(model.context_ops + model.generation_ops)}
+    for name in ("context_gdn_in_proj_ba_gemm", "generation_gdn_in_proj_ba_gemm"):
+        assert by_name[name]._quant_mode == _BF16, name
+    for name in ("context_gdn_in_proj_gemm", "generation_gdn_out_proj_gemm"):
+        assert by_name[name]._quant_mode == common.GEMMQuantMode.fp8_static, name
+
+
+def test_qwen36_fp8_native_checkpoint_threads_fp8_block_to_projection_and_shared_gemms(monkeypatch):
+    model_name = "Qwen/Qwen3.5-35B-A3B"
+    model_info = copy.deepcopy(core_models._get_model_info(model_name))
+    model_info["raw_config"]["quantization_config"] = _fp8_raw_config(_QWEN36_FP8_EXCLUSIONS)["quantization_config"]
+    model_info["gemm_quant_mode_is_explicit"] = False
+    monkeypatch.setattr(core_models, "_get_model_info", lambda _model_path: model_info)
+
+    model_config = sdk_config.ModelConfig(
+        tp_size=4,
+        pp_size=1,
+        moe_tp_size=4,
+        moe_ep_size=1,
+        attention_dp_size=1,
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+    )
+    model_config._gemm_quant_mode_is_explicit = False
+    model = models.get_model(model_name, model_config, "sglang")
+    by_name = {op._name: op for op in _flatten_ops(model.context_ops + model.generation_ops)}
+
+    for name in (
+        "context_gdn_in_proj_gemm",
+        "context_gdn_out_proj_gemm",
+        "context_qkv_gemm",
+        "context_proj_gemm",
+        "context_gdn_shared_gate_up_gemm",
+        "context_gdn_shared_down_gemm",
+        "generation_full_shared_down_gemm",
+    ):
+        assert by_name[name]._quant_mode == _FP8, name
+    for name in ("context_gdn_in_proj_ba_gemm", "generation_gdn_in_proj_ba_gemm"):
+        assert by_name[name]._quant_mode == _BF16, name

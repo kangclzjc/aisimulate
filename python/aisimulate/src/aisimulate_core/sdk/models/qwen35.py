@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import re
+from fnmatch import fnmatchcase
+from functools import cache
+
 import aisimulate_core.sdk.operations as ops
 from aisimulate_core.sdk import common
 from aisimulate_core.sdk.models.base import BaseModel, register_model
@@ -17,24 +21,126 @@ from aisimulate_core.sdk.utils import _get_language_quantization_config
 
 _MAMBA_SSM_DTYPE_BYTES = {"float32": 4, "bfloat16": 2, "float16": 2}
 
+# Per-layer module paths of the GEMMs that make up each mixed-precision
+# category. Checkpoint exclusion entries are matched against these modules
+# (or an enclosing module) instead of by substring, so a checkpoint that only
+# keeps tiny sub-modules unquantized (norms, the ``mlp.gate`` router,
+# ``shared_expert_gate``, GDN ``conv1d``/``A_log``/``dt_bias``/``in_proj_a``)
+# does not demote a whole GEMM category to BF16.
+_CATEGORY_GEMM_MODULES = {
+    "projection": (
+        "linear_attn.in_proj_qkvz",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.in_proj_z",
+        "linear_attn.out_proj",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "self_attn.qkv_proj",
+    ),
+    # The GDN b/a GEMM (``in_proj_ba``, or the separate ``in_proj_a`` /
+    # ``in_proj_b``) follows the projection mode unless the checkpoint keeps
+    # it unquantized on its own (see ``_qwen35_mixed_precision_gemm_modes``).
+    "gdn_ba": ("linear_attn.in_proj_ba", "linear_attn.in_proj_a", "linear_attn.in_proj_b"),
+    "dense_ffn": ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "mlp.gate_up_proj"),
+    "shared_expert": (
+        "mlp.shared_expert.gate_proj",
+        "mlp.shared_expert.up_proj",
+        "mlp.shared_expert.down_proj",
+        "mlp.shared_expert.gate_up_proj",
+    ),
+}
+# Decoder-layer prefixes seen in Qwen3.5/3.6 (nested ``text_config``) and
+# Qwen3.8 (flat) checkpoints. Literal layer indices are normalized to ``0``.
+_DECODER_LAYER_PREFIXES = ("model.layers.0.", "model.language_model.layers.0.")
+_LAYER_INDEX_RE = re.compile(r"layers\.\d+\b")
+_GLOB_CHARS = frozenset("*?[")
+_GDN_BA_TARGET_SUFFIXES = tuple(f".{module}" for module in _CATEGORY_GEMM_MODULES["gdn_ba"])
+
+
+@cache
+def _category_match_names(category: str) -> frozenset[str]:
+    """Fully-qualified names, enclosing modules, and dotted suffixes for a category's GEMMs."""
+    names: set[str] = set()
+    for prefix in _DECODER_LAYER_PREFIXES:
+        # The decoder layer itself (``model.layers.0``, ``layers.0``), so a
+        # whole-layer literal behaves like the whole-layer glob ``layers.0.*``.
+        parts = prefix.rstrip(".").split(".")
+        names.update(".".join(parts[i:]) for i in range(len(parts) - 1))
+    for module in _CATEGORY_GEMM_MODULES[category]:
+        parts = module.split(".")
+        # The GEMM itself plus every enclosing module below the decoder layer
+        # (``self_attn``, ``mlp.shared_expert``, ``mlp``), so a pattern naming
+        # the whole block still covers its GEMMs.
+        for depth in range(len(parts), 0, -1):
+            relative = ".".join(parts[:depth])
+            for prefix in _DECODER_LAYER_PREFIXES:
+                full = f"{prefix}{relative}"
+                full_parts = full.split(".")
+                names.update(".".join(full_parts[i:]) for i in range(len(full_parts)))
+    return frozenset(names)
+
+
+def _exclusion_covers_category(pattern: str, category: str) -> bool:
+    """Whether one checkpoint exclusion entry names a GEMM of ``category``.
+
+    Accepts literal module paths (``model.layers.3.self_attn.q_proj``), bare
+    per-layer suffixes (``self_attn``, ``linear_attn.out_proj``), ModelOpt
+    globs (``model.language_model.layers.0.self_attn*``, ``*.mlp.shared_expert.*``)
+    and compressed-tensors regexes (``re:.*self_attn.*``, anchored at the start
+    of the module path like compressed-tensors' ``re.match``).
+
+    Unlike transformers' ``modules_to_not_convert`` substring test, bare
+    substrings (``attn``, ``proj``) and parameter names (``...q_proj.weight``)
+    are deliberately not honored: every known checkpoint lists full module
+    paths, and substring hits are what demoted whole categories on norms and
+    router entries before.
+    """
+    p = pattern.strip().lower()
+    if not p:
+        return False
+    if p.startswith("re:"):
+        try:
+            regex = re.compile(p[3:])
+        except re.error:
+            return False
+        return any(
+            regex.match(f"{prefix}{module}")
+            for prefix in _DECODER_LAYER_PREFIXES
+            for module in _CATEGORY_GEMM_MODULES[category]
+        )
+    p = _LAYER_INDEX_RE.sub("layers.0", p)
+    names = _category_match_names(category)
+    if _GLOB_CHARS.isdisjoint(p):
+        return p in names
+    return any(fnmatchcase(name, p) for name in names)
+
 
 def _qwen35_mixed_precision_gemm_modes(
     raw_config: dict,
     default: common.GEMMQuantMode,
     *,
     allow_checkpoint_split: bool,
-) -> tuple[common.GEMMQuantMode, common.GEMMQuantMode, common.GEMMQuantMode]:
-    """Resolve projection, dense-FFN, and shared-expert GEMM modes.
+) -> tuple[common.GEMMQuantMode, common.GEMMQuantMode, common.GEMMQuantMode, common.GEMMQuantMode]:
+    """Resolve projection, GDN b/a, dense-FFN, and shared-expert GEMM modes.
 
     Explicit per-layer metadata is authoritative. When a category has no
     explicit entry, checkpoint exclusions keep it in BF16 instead of applying
     a broad ``Linear`` config group to every operation.
+
+    The GDN b/a GEMM follows the projection mode unless the checkpoint keeps
+    it unquantized: either ``linear_attn.in_proj_a``/``in_proj_b``/
+    ``in_proj_ba`` is excluded, or a ModelOpt ``quantized_layers`` map
+    enumerates the GDN projection GEMMs without naming any of them (ModelOpt
+    lists every quantized module, so an absent entry is a BF16 weight).
     """
     if not allow_checkpoint_split:
-        return default, default, default
+        return default, default, default, default
 
-    modes = {"projection": default, "dense_ffn": default, "shared_expert": default}
+    modes = {"projection": default, "gdn_ba": default, "dense_ffn": default, "shared_expert": default}
     explicit: set[str] = set()
+    gdn_projection_explicit = False
     algo_modes = {
         "fp8": common.GEMMQuantMode.fp8_static,
         "mxfp8": common.GEMMQuantMode.fp8,
@@ -66,8 +172,11 @@ def _qwen35_mixed_precision_gemm_modes(
                 continue
             target_name = str(target).lower()
             category = None
-            if ".linear_attn." in target_name or ".self_attn." in target_name:
+            if target_name.endswith(_GDN_BA_TARGET_SUFFIXES):
+                category = "gdn_ba"
+            elif ".linear_attn." in target_name or ".self_attn." in target_name:
                 category = "projection"
+                gdn_projection_explicit |= ".linear_attn." in target_name
             elif "shared_expert" in target_name:
                 category = "shared_expert"
             elif ".mlp." in target_name and not _is_routing_expert_target(target_name):
@@ -76,15 +185,19 @@ def _qwen35_mixed_precision_gemm_modes(
                 modes[category] = mode
                 explicit.add(category)
 
-    exclusions = tuple(str(pattern).lower() for pattern in quant_exclude_patterns(raw_config))
-    if "projection" not in explicit and any("linear_attn" in p or "self_attn" in p for p in exclusions):
-        modes["projection"] = common.GEMMQuantMode.bfloat16
-    if "shared_expert" not in explicit and any("shared_expert" in p for p in exclusions):
-        modes["shared_expert"] = common.GEMMQuantMode.bfloat16
-    if "dense_ffn" not in explicit and any(".mlp" in p and "shared_expert" not in p for p in exclusions):
-        modes["dense_ffn"] = common.GEMMQuantMode.bfloat16
+    exclusions = tuple(str(pattern) for pattern in quant_exclude_patterns(raw_config))
+    # Routed experts (``mlp.experts.*``) never match: they are not listed in
+    # ``_CATEGORY_GEMM_MODULES``.
+    for category in ("projection", "dense_ffn", "shared_expert"):
+        if category not in explicit and any(_exclusion_covers_category(p, category) for p in exclusions):
+            modes[category] = common.GEMMQuantMode.bfloat16
+    if "gdn_ba" not in explicit:
+        if gdn_projection_explicit or any(_exclusion_covers_category(p, "gdn_ba") for p in exclusions):
+            modes["gdn_ba"] = common.GEMMQuantMode.bfloat16
+        else:
+            modes["gdn_ba"] = modes["projection"]
 
-    return modes["projection"], modes["dense_ffn"], modes["shared_expert"]
+    return modes["projection"], modes["gdn_ba"], modes["dense_ffn"], modes["shared_expert"]
 
 
 @register_model("QWEN35")
@@ -139,6 +252,7 @@ class Qwen35Model(BaseModel):
 
         (
             self._projection_gemm_quant_mode,
+            self._gdn_ba_gemm_quant_mode,
             self._dense_ffn_gemm_quant_mode,
             self._shared_expert_gemm_quant_mode,
         ) = _qwen35_mixed_precision_gemm_modes(
@@ -263,6 +377,7 @@ class Qwen35Model(BaseModel):
         attn_dp = self.config.attention_dp_size
         attn_ar_folded = self._sglang_folds_attn_ar()
         projection_gemm_q = self._projection_gemm_quant_mode
+        gdn_ba_gemm_q = self._gdn_ba_gemm_quant_mode
         dense_ffn_gemm_q = self._dense_ffn_gemm_quant_mode
         shared_expert_gemm_q = self._shared_expert_gemm_quant_mode
         kvcache_q = self.config.kvcache_quant_mode
@@ -307,7 +422,7 @@ class Qwen35Model(BaseModel):
                     ops.ElementWise("context_gdn_norm", c, 2 * h, 2 * h, 0.8),
                     ops.GEMM("context_gdn_in_proj_gemm", c, gdn_in_proj_out, h, projection_gemm_q),
                     # 2*nv/tp drops below the collected GEMM n-grid at high TP.
-                    ops.GEMM("context_gdn_in_proj_ba_gemm", c, gdn_ba_out, h, projection_gemm_q, below_grid_sol=True),
+                    ops.GEMM("context_gdn_in_proj_ba_gemm", c, gdn_ba_out, h, gdn_ba_gemm_q, below_grid_sol=True),
                     ops.GDNKernel(
                         "context_gdn_conv1d",
                         c,
@@ -646,6 +761,7 @@ class Qwen35Model(BaseModel):
         attn_dp = self.config.attention_dp_size
         attn_ar_folded = self._sglang_folds_attn_ar()
         projection_gemm_q = self._projection_gemm_quant_mode
+        gdn_ba_gemm_q = self._gdn_ba_gemm_quant_mode
         dense_ffn_gemm_q = self._dense_ffn_gemm_quant_mode
         shared_expert_gemm_q = self._shared_expert_gemm_quant_mode
         kvcache_q = self.config.kvcache_quant_mode
@@ -685,9 +801,7 @@ class Qwen35Model(BaseModel):
                 [
                     ops.ElementWise("generation_gdn_norm", c, 2 * h, 2 * h, 0.8),
                     ops.GEMM("generation_gdn_in_proj_gemm", c, gdn_in_proj_out, h, projection_gemm_q),
-                    ops.GEMM(
-                        "generation_gdn_in_proj_ba_gemm", c, gdn_ba_out, h, projection_gemm_q, below_grid_sol=True
-                    ),
+                    ops.GEMM("generation_gdn_in_proj_ba_gemm", c, gdn_ba_out, h, gdn_ba_gemm_q, below_grid_sol=True),
                     ops.GDNKernel(
                         "generation_gdn_conv1d",
                         c,
