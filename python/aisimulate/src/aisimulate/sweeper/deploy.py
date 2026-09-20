@@ -10,7 +10,12 @@ from copy import deepcopy
 from typing import Any
 
 from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_blocks
-from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control, omit_inactive_moe_controls
+from ..config.common import (
+    ENGINE_MODEL_CONTROL_FIELDS,
+    is_active_engine_model_control,
+    omit_inactive_moe_controls,
+    sglang_prefill_controls,
+)
 from ..config.engine import NgramSpeculationConfig
 from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimatorSpec
 
@@ -97,6 +102,9 @@ def _engine_args_payload(
         memory_fraction_field: float(memory_fraction),
         "enable_prefix_caching": bool(sample[f"{role}_enable_prefix_caching"]),
     }
+    if backend == "sglang":
+        # Same lowering as the predict compiler, or the searched dimension is a no-op.
+        payload["sglang"] = sglang_prefill_controls(payload["max_num_batched_tokens"])
     if sample.get("context_length") is not None:
         payload["max_model_len"] = int(sample["context_length"])
     if moe_tp * moe_ep > 1:

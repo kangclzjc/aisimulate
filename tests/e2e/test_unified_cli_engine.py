@@ -43,6 +43,7 @@ _EXPECTED_PREDICT_CASES = (
     "11-synthetic-afd.yaml",
     "11-trace-weka-agentic-lane.yaml",
     "12-trace-weka-jsonl-agentic-lane.yaml",
+    "13-synthetic-sglang-chunked-prefill.yaml",
 )
 _EXPECTED_RECOMMEND_CASES = (
     "01-default-preset-throughput.yaml",
@@ -176,6 +177,32 @@ def test_engine_predict_cli_cases(config_path: Path, tmp_path: Path) -> None:
         assert "heuristically resolved one nested timestamp basis" in result.stderr
         assert "complete Weka corpus" in result.stderr
         assert "requested='auto', resolved='absolute'" in result.stderr
+
+
+def test_sglang_max_batched_tokens_changes_prefill_pass_count(tmp_path: Path) -> None:
+    """The unified knob must reach the SGLang scheduler: fewer tokens per pass means more fixed-cost passes."""
+    config_path = _CONFIG_ROOT / "predict/engine/13-synthetic-sglang-chunked-prefill.yaml"
+    ttft = {}
+    for max_batched_tokens in (2048, 8192):
+        result = _run_cli(
+            "predict",
+            "--stack",
+            "engine",
+            "--config",
+            str(config_path),
+            "--set",
+            f"engine.workers.aggregated.scheduler.max_batched_tokens={max_batched_tokens}",
+            "--output-dir",
+            str(tmp_path / str(max_batched_tokens)),
+            "--format",
+            "json",
+        )
+        summary = json.loads(result.stdout)
+        assert summary["completed_requests"] == 4
+        ttft[max_batched_tokens] = summary["mean_ttft_ms"]
+    # prefill_ms is 10 per pass: one 8192-token pass versus four 2048-token chunks for a 7000-token prompt.
+    assert ttft[8192] == pytest.approx(10.0)
+    assert ttft[2048] == pytest.approx(40.0)
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Long prompts on SGLang: scheduler.max_batched_tokens sets both --chunked-prefill-size and
+# --max-prefill-tokens, so a 7000-token prompt takes ceil(7000 / 8192) = 1 fixed-cost prefill pass here
+# and ceil(7000 / 2048) = 4 passes when the driver lowers the knob to 2048.
+traffic:
+  source: {type: synthetic, input_tokens: 7000, output_tokens: 8}
+  load: {type: concurrency, concurrency: 1}
+  stop: {requests: 4}
+
+engine:
+  mode: aggregated
+  model: tests/e2e/configs/unified_cli/fixtures/tiny-model
+  hardware: h200_sxm
+  backend: sglang
+  context_length: 16384
+  workers:
+    aggregated:
+      parallelism: {replicas: 1, tensor: 1, pipeline: 1, attention_data: 1, moe_tensor: 1, moe_expert: 1}
+      scheduler: {max_batched_tokens: 8192, max_sequences: 64}
+      kv_cache: {block_size: 1, prefix_caching: false, capacity: {type: fixed, blocks: 32768}}
+      timing: {type: fixed, prefill_ms: 10, decode_ms: 1}

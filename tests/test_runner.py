@@ -494,6 +494,61 @@ def test_runner_lowers_sglang_with_prefix_caching_disabled():
     assert runtime.execution_spec["engine"]["rank"]["enable_prefix_caching"] is False
 
 
+def test_runner_forwards_sglang_prefill_controls_to_rank_config():
+    runtime = RecordingRuntime()
+    engine_args = _engine_args(backend="sglang")
+    engine_args.update(
+        {
+            "block_size": 1,
+            "max_num_batched_tokens": 16384,
+            "sglang": {"chunked_prefill_size": 16384, "max_prefill_tokens": 16384},
+        }
+    )
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg",
+        backend="sglang",
+        backend_version="test",
+        agg_engine_args=engine_args,
+        num_workers=1,
+    )
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=deployment))
+
+    rank = runtime.execution_spec["engine"]["rank"]
+    assert rank["max_num_batched_tokens"] == 16384
+    assert rank["sglang"] == {"chunked_prefill_size": 16384, "max_prefill_tokens": 16384}
+
+
+def test_runner_forwards_sglang_prefill_controls_per_disaggregated_role():
+    runtime = RecordingRuntime()
+    roles = {}
+    for role, tokens in (("prefill", 32768), ("decode", 4096)):
+        args = _engine_args(role=role, backend="sglang")
+        args.update(
+            {
+                "block_size": 1,
+                "max_num_batched_tokens": tokens,
+                "sglang": {"chunked_prefill_size": tokens, "max_prefill_tokens": tokens},
+            }
+        )
+        roles[role] = args
+    deployment = BackendDeploymentSpec(
+        deployment_mode="disagg",
+        backend="sglang",
+        backend_version="test",
+        prefill_engine_args=roles["prefill"],
+        decode_engine_args=roles["decode"],
+        num_prefill_workers=1,
+        num_decode_workers=1,
+    )
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(_spec(deployment=deployment))
+
+    for role, tokens in (("prefill", 32768), ("decode", 4096)):
+        rank = runtime.execution_spec["engine"][role]["rank"]
+        assert rank["sglang"] == {"chunked_prefill_size": tokens, "max_prefill_tokens": tokens}
+
+
 def test_runner_preserves_native_host_offload_rank_config():
     runtime = RecordingRuntime()
     engine_args = _engine_args()

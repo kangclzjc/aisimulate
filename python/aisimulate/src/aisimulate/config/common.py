@@ -251,3 +251,19 @@ def omit_inactive_moe_controls(config: dict[str, Any]) -> dict[str, Any]:
         if not is_active_engine_model_control(name, result.get(name)):
             result.pop(name, None)
     return result
+
+
+def sglang_prefill_controls(max_batched_tokens: int) -> dict[str, int]:
+    """Lower the unified ``scheduler.max_batched_tokens`` onto the SGLang prefill controls.
+
+    The Rust SGLang replay scheduler does not read ``max_num_batched_tokens`` (vLLM
+    only); it budgets prefill through ``sglang.max_prefill_tokens``
+    (``--max-prefill-tokens``) and ``sglang.chunked_prefill_size``
+    (``--chunked-prefill-size``). Both are per-pass budgets shared by every request
+    admitted in that pass: ``PrefillAdder`` decrements ``rem_input_tokens`` and
+    ``rem_chunk_tokens`` per admitted request, and a single long request can take at
+    most ``chunked_prefill_size`` tokens per pass. One unified knob drives both so the
+    YAML value is not silently replaced by the runtime defaults. Attention-DP
+    normalization (chunk / dp_size) stays in the runtime, as in SGLang's launch path.
+    """
+    return {"chunked_prefill_size": max_batched_tokens, "max_prefill_tokens": max_batched_tokens}

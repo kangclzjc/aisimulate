@@ -1359,3 +1359,134 @@ def test_role_systems_roots_reach_prediction_and_search_preflight(tmp_path, mode
     (branch,) = enumerate_branches(smart, max_seq_len=4096)
     assert branch.parallel_configs
     assert branch.deployment_mode == ("agg" if mode == "aggregated" else "disagg")
+
+
+def _sglang_chunk_prediction(mode: str, backend: str) -> CorePredictionConfig:
+    worker = {
+        "parallelism": {"tensor": 1},
+        "kv_cache": {"capacity": {"type": "fixed", "blocks": 64}},
+        "timing": {"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+    }
+    workers = (
+        {"aggregated": {**worker, "scheduler": {"max_batched_tokens": 16384}}}
+        if mode == "aggregated"
+        else {
+            "prefill": {**worker, "scheduler": {"max_batched_tokens": 16384, "max_sequences": 1}},
+            "decode": {**worker, "scheduler": {"max_batched_tokens": 4096}},
+        }
+    )
+    return CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                **_engine(),
+                "mode": mode,
+                "backend": backend,
+                "backend_version": "test",
+                "context_length": 4096,
+                "workers": workers,
+            },
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 2},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+def test_max_batched_tokens_lowers_onto_sglang_prefill_controls(mode, backend):
+    """SGLang budgets prefill through ``sglang.*``; vLLM/TRT-LLM keep only ``max_num_batched_tokens``."""
+    from aisimulate.compiler import prediction_to_replay_spec
+
+    deployment = prediction_to_replay_spec(_sglang_chunk_prediction(mode, backend)).backend_deployment
+    roles = {"aggregated": {"agg": 16384}, "disaggregated": {"prefill": 16384, "decode": 4096}}[mode]
+    for role, tokens in roles.items():
+        args = getattr(deployment, f"{role}_engine_args")
+        assert args["max_num_batched_tokens"] == tokens
+        if backend == "sglang":
+            assert args["sglang"] == {"chunked_prefill_size": tokens, "max_prefill_tokens": tokens}
+        else:
+            assert "sglang" not in args
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+def test_prediction_rejects_sglang_max_batched_tokens_below_attention_data(role: str) -> None:
+    """The runtime divides the SGLang chunked-prefill budget by attention DP; zero must fail at schema time."""
+    engine = _engine()
+    engine["backend"] = "sglang"
+    if role != "aggregated":
+        engine["mode"] = "disaggregated"
+        engine["workers"] = {"prefill": {}, "decode": {}}
+    engine["workers"][role] = {"parallelism": {"attention_data": 8}, "scheduler": {"max_batched_tokens": 4}}
+
+    with pytest.raises(
+        ValidationError,
+        match=rf"workers.{role}.scheduler.max_batched_tokens=4 must be >= workers.{role}.parallelism.attention_data=8",
+    ):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("backend,max_batched_tokens", [("sglang", 8), ("sglang", 16), ("vllm", 4), ("trtllm", 4)])
+def test_prediction_sglang_prefill_budget_check_is_backend_specific(backend: str, max_batched_tokens: int) -> None:
+    engine = _engine()
+    engine["backend"] = backend
+    engine["workers"]["aggregated"] = {
+        "parallelism": {"attention_data": 8},
+        "scheduler": {"max_batched_tokens": max_batched_tokens},
+    }
+
+    config = CorePredictionConfig.model_validate({"engine": engine})
+
+    assert config.engine.workers.aggregated.scheduler.max_batched_tokens == max_batched_tokens
+
+
+def test_recommendation_rejects_concrete_sglang_max_batched_tokens_below_attention_data() -> None:
+    engine = {
+        **_engine(),
+        "mode": "aggregated",
+        "backend": "sglang",
+        "workers": {
+            "aggregated": {
+                "parallelism": {"preset": False, "attention_data": 8},
+                "scheduler": {"max_batched_tokens": 4},
+            }
+        },
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match=r"workers.aggregated.scheduler.max_batched_tokens=4 must be >= "
+        r"workers.aggregated.parallelism.attention_data=8",
+    ):
+        CoreRecommendationConfig.model_validate({"engine": engine, "optimization": {}})
+
+
+@pytest.mark.parametrize(
+    "backend,max_batched_tokens",
+    [
+        ("sglang", {"choices": [4, 8192]}),
+        ({"choices": ["vllm", "sglang"]}, 4),
+        ("vllm", 4),
+    ],
+)
+def test_recommendation_defers_sglang_prefill_budget_domains_to_candidate_filtering(
+    backend, max_batched_tokens
+) -> None:
+    """Only a fully concrete sglang/budget/attention-DP triple is rejected at schema time."""
+    engine = {
+        **_engine(),
+        "mode": "aggregated",
+        "backend": backend,
+        "workers": {
+            "aggregated": {
+                "parallelism": {"preset": False, "attention_data": 8},
+                "scheduler": {"max_batched_tokens": max_batched_tokens},
+            }
+        },
+    }
+
+    config = CoreRecommendationConfig.model_validate({"engine": engine, "optimization": {}})
+
+    assert config.engine.workers.aggregated is not None

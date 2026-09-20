@@ -14,7 +14,7 @@ from .capacity import (
     resolve_model_context_length,
 )
 from .config.cli import CorePredictionConfig
-from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_controls
+from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_controls, sglang_prefill_controls
 from .config.engine import EnginePredictionConfig, WorkerPredictionConfig
 from .config.traffic import SyntheticSessionSource, SyntheticSource, TraceSource
 from .sweeper.afd_parallel import AFDParallelConfig, AFDTopology
@@ -424,6 +424,9 @@ def _worker_engine_args(
         "enable_prefix_caching": cache.prefix_caching,
         "startup_time": worker.startup_seconds,
     }
+    if backend == "sglang":
+        # The Rust SGLang scheduler ignores ``max_num_batched_tokens``; see the helper.
+        payload["sglang"] = sglang_prefill_controls(worker.scheduler.max_batched_tokens)
     if engine.speculation is not None:
         payload["speculation"] = engine.speculation.model_dump(mode="json")
     if engine.backend_version is not None:

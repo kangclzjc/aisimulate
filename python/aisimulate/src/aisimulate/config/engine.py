@@ -425,6 +425,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_prediction_host_offload(self)
         _validate_backend_block_sizes(backends={self.backend}, modes={self.mode}, workers=self.workers)
         _validate_prediction_scheduler_backend(self)
+        _validate_prediction_sglang_prefill_budget(self)
         _validate_speculation(self, modes={self.mode}, backends={self.backend})
         return self
 
@@ -601,6 +602,7 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
             if unknown:
                 raise ValueError(f"backend_version contains unconfigured backend(s): {unknown}")
         _validate_recommendation_host_offload(self)
+        _validate_recommendation_sglang_prefill_budget(self)
         _validate_speculation(self, modes=modes, backends=backends)
         _validate_backend_block_sizes(backends=backends, modes=modes, workers=self.workers)
         return self
@@ -658,6 +660,60 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")
+
+
+def _sglang_prefill_budget_error(role: str, *, max_batched_tokens: int, attention_data: int) -> str:
+    return (
+        f"workers.{role}.scheduler.max_batched_tokens={max_batched_tokens} must be >= "
+        f"workers.{role}.parallelism.attention_data={attention_data} for backend=sglang: "
+        "the SGLang runtime divides the chunked-prefill budget across attention-DP ranks "
+        "and this value would leave zero prefill tokens per rank"
+    )
+
+
+def _validate_prediction_sglang_prefill_budget(engine: EnginePredictionConfig) -> None:
+    """Reject configs whose per-rank SGLang chunked-prefill budget would be zero.
+
+    The unified ``max_batched_tokens`` lowers onto ``sglang.chunked_prefill_size``, which
+    the runtime divides by ``attention_data`` (SGLang launch normalization). Catch the
+    resulting Rust ``ensure!`` failure at schema validation time instead.
+    """
+
+    if engine.backend != "sglang":
+        return
+    for role in ("aggregated", "prefill", "decode"):
+        worker = getattr(engine.workers, role)
+        if worker is None:
+            continue
+        max_batched_tokens = worker.scheduler.max_batched_tokens
+        attention_data = worker.parallelism.attention_data
+        if max_batched_tokens < attention_data:
+            raise ValueError(
+                _sglang_prefill_budget_error(role, max_batched_tokens=max_batched_tokens, attention_data=attention_data)
+            )
+
+
+def _validate_recommendation_sglang_prefill_budget(engine: EngineRecommendationConfig) -> None:
+    """Same check as prediction when backend, budget, and attention DP are all concrete.
+
+    Domains (choices/ranges, presets, mixed backends) are left to candidate filtering,
+    where the concrete prediction validation marks infeasible candidates.
+    """
+
+    if engine.backend != "sglang":
+        return
+    for role in ("aggregated", "prefill", "decode"):
+        worker = getattr(engine.workers, role)
+        if worker is None:
+            continue
+        max_batched_tokens = worker.scheduler.max_batched_tokens
+        attention_data = worker.parallelism.attention_data
+        if not isinstance(max_batched_tokens, int) or not isinstance(attention_data, int):
+            continue
+        if max_batched_tokens < attention_data:
+            raise ValueError(
+                _sglang_prefill_budget_error(role, max_batched_tokens=max_batched_tokens, attention_data=attention_data)
+            )
 
 
 def _validate_prediction_afd(engine: EnginePredictionConfig) -> None:

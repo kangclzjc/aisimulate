@@ -207,6 +207,18 @@ def test_memory_fraction_uses_the_backend_native_field(backend, memory_field):
     )
 
 
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+def test_max_num_batched_tokens_reaches_the_sglang_scheduler(backend):
+    """The searched token budget must drive SGLang's chunk/prefill controls, not only the vLLM field."""
+    engine = _agg_deployment(selection=_agg_selection(backend=backend)).agg_engine_args
+
+    assert engine["max_num_batched_tokens"] == 16384
+    if backend == "sglang":
+        assert engine["sglang"] == {"chunked_prefill_size": 16384, "max_prefill_tokens": 16384}
+    else:
+        assert "sglang" not in engine
+
+
 def test_optional_backend_runtime_values_are_forwarded():
     engine = _agg_deployment(space=_space(startup_time=45.0, aic_nextn=2, nextn_accepted=1.5)).agg_engine_args
 
