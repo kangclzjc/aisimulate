@@ -335,12 +335,19 @@ def _sweep_one_parallel_agg(
     # the legacy find_best_agg_result_under_constraints (its isl_eff) and as
     # run_agg's internal accounting.
     isl = runtime_config.isl + BaseBackend._visual_context_tokens(model, runtime_config)
+    # ctx_tokens budgets UNCACHED prefill tokens (run_agg's isl_new), so the
+    # feasibility guards and the capped-gen dedup pack requests by it.
+    isl_new = max(isl - int(runtime_config.prefix or 0), 1)
     osl = runtime_config.osl
     ttft_target = runtime_config.ttft
     tpot_target = runtime_config.tpot
 
     b_list = [b for b in _DEFAULT_AGG_BATCH_SCHEDULE if b <= max_batch_size]
-    ctx_tokens_list = _agg_ctx_tokens_list(isl, ctx_stride, enable_chunked_prefill)
+    # The grid is built on isl_new too, so its points are multiples of the
+    # uncached prefill and the guards below admit the same (b, requests)
+    # shapes as at prefix 0 (a grid on the full isl would be guarded out
+    # almost entirely for a heavily cached workload).
+    ctx_tokens_list = _agg_ctx_tokens_list(isl_new, ctx_stride, enable_chunked_prefill)
 
     # The capped-gen dedup below assumes the non-speculative schedule
     # (decode_iterations == osl). With speculative progress the boundary is
@@ -357,18 +364,20 @@ def _sweep_one_parallel_agg(
     saw_model_fit = False
     saw_memory_fit = False
     perf_misses = 0
+    guarded_in = 0
 
     for b in b_list:
         for ctx_tokens in ctx_tokens_list:
             # batch / ctx_tokens balance guards (legacy semantics)
-            if b - np.ceil(ctx_tokens / isl) < 0:
+            if b - np.ceil(ctx_tokens / isl_new) < 0:
                 break
-            if b > 1 and (b - np.ceil(ctx_tokens / isl) < 1):
+            if b > 1 and (b - np.ceil(ctx_tokens / isl_new) < 1):
                 break
+            guarded_in += 1
 
             # Skip equivalent gen_tokens slices to avoid recomputing the same point.
             if dedup_gen_slices:
-                balance_score = isl * b / ctx_tokens / osl
+                balance_score = isl_new * b / ctx_tokens / osl
                 if balance_score > 1:
                     gen_tokens = b // balance_score
                     if gen_tokens > 1 and gen_tokens in capped_b:
@@ -417,6 +426,15 @@ def _sweep_one_parallel_agg(
                 results_per_ops_source.append(summary.get_per_ops_source())
                 results_moe_comm_fallbacks.append(merge_moe_comm_fallbacks(summary.get_moe_comm_fallbacks()))
 
+    if guarded_in == 0:
+        logger.warning(
+            "agg sweep: no (batch_size, ctx_tokens) point passed the batch/ctx guards "
+            "(isl=%s, prefix=%s, batch sizes %s, ctx grid %s)",
+            isl,
+            runtime_config.prefix,
+            b_list,
+            ctx_tokens_list,
+        )
     if not results_dict_list:
         return pd.DataFrame(columns=common.ColumnsAgg), saw_model_fit, saw_memory_fit, perf_misses
 

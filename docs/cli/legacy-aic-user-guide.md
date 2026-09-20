@@ -138,7 +138,7 @@ aiconfigurator cli estimate --model-path Qwen/Qwen3-32B --system h200_sxm --tp-s
 - `--isl`: Input sequence length. Default: `1024`
 - `--osl`: Output sequence length. Default: `1024`
 - `--batch-size` (alias `--bs`): Batch size (max concurrent requests, used for agg/static). Default: `128`
-- `--ctx-tokens`: Context tokens budget for IFB scheduling (agg only). Default: same as ISL
+- `--ctx-tokens`: The scheduler's per-step budget of uncached (new) context tokens for IFB scheduling (agg only): SGLang `--chunked-prefill-size`, vLLM `max_num_batched_tokens`, the TRT-LLM scheduler's `max_num_tokens` (TRT-LLM's build-time `max_num_tokens` for activation memory is a separate setting). Default: ISL minus `--prefix` (one request's full uncached prefill per step)
 - `--tp-size` (alias `--tp`): Tensor parallelism size. Default: `1`
 - `--pp-size` (alias `--pp`): Pipeline parallelism size. Default: `1`
 - `--attention-dp-size` (alias `--dp`): Attention data parallelism size. Default: `1`
@@ -149,7 +149,7 @@ aiconfigurator cli estimate --model-path Qwen/Qwen3-32B --system h200_sxm --tp-s
 - `--fmha-quant-mode`: FMHA quantization mode (auto-inferred if omitted). DeepSeek-V3 / Kimi-K2.5 context attention (MLA prefill) has no fp8 FMHA data — auto-inferred fp8 is downgraded to `bfloat16` for context-touching estimates (agg, prefill, static, static_ctx, AFD prefill), while decode/generation keeps fp8. Explicitly passing `fp8` for a context estimate is rejected with a clear error.
 - `--moe-quant-mode`: MoE quantization mode (auto-inferred if omitted)
 - `--comm-quant-mode`: Communication quantization mode (auto-inferred; default `half`)
-- `--prefix`: Prefix cache length (subset of ISL already cached per request). Default: `0`
+- `--prefix`: Prefix cache length (subset of ISL already cached per request). Default: `0`. Cached tokens are KV context only: the mixed-step schedule packs requests by their uncached `ISL - prefix` tokens, so at a fixed `--ctx-tokens` a larger prefix means fewer mix steps and higher throughput. TTFT drops when the uncached prefill needs fewer chunks (`ceil((ISL - prefix) / ctx_tokens)`) or queues behind fewer steps; a step that already holds one whole request costs about the same as without the prefix (its new tokens attend over more cached KV), so TTFT is roughly flat in that regime. A budget that is not a multiple of `ISL - prefix` is filled with one partial request, never rounded up to a whole one; the per-step request count is capped at `--batch-size`
 - `--nextn`: MTP draft length, or `auto` to use the checkpoint's `num_nextn_predict_layers` (absent/0 keeps MTP disabled). Default: `0`; MTP is never enabled implicitly — pass `--nextn` explicitly to model it
 - `--nextn-accepted`: Average accepted draft tokens per decode step (`0 <= nextn_accepted <= nextn`). Required when the draft depth is > 0 (including via `--nextn auto`); use a measured value from your deployment
 - `--stride`: (static modes only) OSL-sweep stride used by `run_static`; ignored for `agg`/`disagg`. Default: `32`

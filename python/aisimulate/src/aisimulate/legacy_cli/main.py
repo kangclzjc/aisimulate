@@ -1053,7 +1053,12 @@ def _add_estimate_mode_arguments(parser):
         "--ctx-tokens",
         type=int,
         default=None,
-        help="Context tokens budget for IFB scheduling (agg only). Default: same as ISL.",
+        help=(
+            "The scheduler's per-step budget of uncached (new) context tokens for IFB scheduling (agg only): "
+            "SGLang --chunked-prefill-size / vLLM max_num_batched_tokens / TRT-LLM scheduler max_num_tokens "
+            "(TRT-LLM's build-time max_num_tokens for activation memory is separate). "
+            "Default: ISL minus --prefix."
+        ),
     )
 
     # Shared parallelism defaults (also used as fallback for prefill/decode-specific args)

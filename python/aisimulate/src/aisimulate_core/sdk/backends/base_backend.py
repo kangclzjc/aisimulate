@@ -150,6 +150,10 @@ class BaseBackend:
         generating). This method encodes the engine's scheduling policy for how many
         decode-phase requests participate alongside the prefilling request(s).
 
+        ``isl`` is the UNCACHED prefill length of one request (effective isl
+        minus the cached prefix): ``ctx_tokens`` budgets new tokens, so that is
+        the length requests pack by.
+
         Subclasses should override to match their engine's scheduling behaviour.
         """
         steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
@@ -1462,6 +1466,12 @@ class BaseBackend:
         ``run_static`` / ``run_agg`` do, so direct callers (e.g.
         ``InferenceSession.run_mixed``) get the effective sequence length
         without pre-adjusting the config.
+
+        ``step.context_tokens`` budgets UNCACHED prefill tokens (SGLang
+        ``--chunked-prefill-size``, vLLM ``max_num_batched_tokens``, the
+        TRT-LLM scheduler's ``max_num_tokens``). The full ``isl`` and
+        ``prefix`` go to the engine, which packs requests by ``isl - prefix``
+        and keeps the prefix as KV context for the attention pass only.
         """
         isl = int(runtime_config.isl or 0)
         osl = int(runtime_config.osl or 0)
@@ -1498,8 +1508,11 @@ class BaseBackend:
         latency_ms = float(components["latency_ms"])
         energy_wms = float(components["energy_wms"])
         if self._has_visual_context_work(model, runtime_config):
-            visual_batch = int(np.ceil(step.context_tokens / isl))
-            visual_scale = float(np.ceil(isl / step.context_tokens))
+            # Requests per mixed step follow the uncached prefill length, as
+            # in the engine's context-attention pass.
+            isl_new = max(isl - prefix, 1)
+            visual_batch = int(np.ceil(step.context_tokens / isl_new))
+            visual_scale = float(np.ceil(isl_new / step.context_tokens))
             visual_latency, visual_energy, visual_source = self._run_visual_context_phase(
                 model,
                 database,
@@ -1658,12 +1671,30 @@ class BaseBackend:
         """Run the agg (continuous-batching) inference for a single (b, ctx_tokens) point."""
         text_isl = runtime_config.isl
         osl = runtime_config.osl
-        prefix = runtime_config.prefix
+        prefix = int(runtime_config.prefix or 0)
         b = runtime_config.batch_size
         img_ctx_tokens = self._visual_context_tokens(model, runtime_config)
         isl = text_isl + img_ctx_tokens
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        if prefix >= isl:
+            # Same contract as run_mixed / the engine: a request must carry at
+            # least one uncached token.
+            raise ValueError(f"prefix ({prefix}) must be smaller than the effective isl ({isl}) for an agg run")
+        # ``ctx_tokens`` budgets UNCACHED (new) prefill tokens per mixed step —
+        # what SGLang --chunked-prefill-size, vLLM max_num_batched_tokens and
+        # the TRT-LLM scheduler's max_num_tokens actually cap — so the schedule
+        # below packs requests by ``isl_new``. The cached prefix still reaches
+        # the per-step cost (run_mixed, as KV context) and the KV footprint
+        # (_get_memory_usage); both receive the full ``isl`` and ``prefix``.
+        isl_new = max(isl - prefix, 1)
+        # A mixed step cannot hold more uncached tokens than the batch owns, so
+        # the schedule runs on the budget capped at b * isl_new: the packed
+        # request count then never exceeds b (a large prefix makes
+        # ceil(ctx_tokens / isl_new) > b reachable with ordinary inputs, which
+        # used to publish negative decode-request counts). ``ctx_tokens`` stays
+        # the published engine knob.
+        ctx_budget = min(ctx_tokens, b * isl_new) if b > 1 else ctx_tokens
         # None (or an omitted kwarg) means the caller did not model speculative
         # progress here; the summary then stays eligible for the upper-layer
         # post-hoc projection (SpeculativeDecodingProfile.project_summary).
@@ -1680,7 +1711,7 @@ class BaseBackend:
                 f"decode_tokens_per_iteration must be finite and within [1, nextn + 1={max_decode_progress:g}]"
             )
         decode_iterations = 1.0 + max(osl - 1, 0) / decode_tokens_per_iteration
-        balance_score = isl * b / ctx_tokens / decode_iterations
+        balance_score = isl_new * b / ctx_budget / decode_iterations
 
         # Backend-specific kwargs (TRT-LLM: max_seq_len / max_num_tokens /
         # free_gpu_memory_fraction; vLLM / SGLang: free_gpu_memory_fraction).
@@ -1723,16 +1754,17 @@ class BaseBackend:
         encoder_memory_total = encoder_memory.get("total", 0.0)
 
         # Compute the mean-field number of engine iterations needed to consume
-        # all context and commit the requested output tokens.
-        steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
+        # all UNCACHED context and commit the requested output tokens.
+        steps_to_finish_ctx = np.ceil(isl_new * b / ctx_budget)
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
-            num_mix_gen_tokens = self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
+            num_mix_gen_tokens = self._mix_step_gen_tokens(b, ctx_budget, isl_new, decode_iterations)
             assert num_mix_gen_tokens >= 1, (
-                f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
+                f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, "
+                f"ctx_budget: {ctx_budget}, isl: {isl}, prefix: {prefix}"
             )
-            num_mix_ctx_tokens = ctx_tokens
+            num_mix_ctx_tokens = ctx_budget
             if steps_to_finish_ctx >= decode_iterations:
                 num_mix_steps = steps_to_finish_ctx
                 num_genonly_steps = 0
@@ -1797,9 +1829,10 @@ class BaseBackend:
         # TTFT: per-request prefill time * queuing factor, plus encoder latency.
         # _mix_step_efficiency reduces mix_step_latency_ms based on the fraction of
         # decode tokens in the step. For TTFT we need the pure prefill cost (no decode
-        # tokens alongside), so we undo that efficiency reduction first.
+        # tokens alongside), so we undo that efficiency reduction first. A request
+        # needs ceil(isl_new / ctx_budget) chunks for its uncached prefill.
         _prefill_step_ms = mix_step_latency_ms / mix_efficiency if mix_efficiency > 0 else mix_step_latency_ms
-        _ttft_per_request = _prefill_step_ms * np.ceil(isl / ctx_tokens) + self._prefill_dispatch_overhead_ms(model)
+        _ttft_per_request = _prefill_step_ms * np.ceil(isl_new / ctx_budget) + self._prefill_dispatch_overhead_ms(model)
         ttft = encoder_latency_ms + _ttft_per_request * self._ttft_queuing_factor(b, steps_to_finish_ctx)
         logger.debug(
             f"ttft: prefill_step={_prefill_step_ms:.2f}ms qf={self._ttft_queuing_factor(b, steps_to_finish_ctx):.2f}"
@@ -1842,7 +1875,9 @@ class BaseBackend:
         agg_power_avg_w = total_energy_wms / total_latency_ms if total_latency_ms > 0 else 0.0
         logger.debug(f"Aggregated power: {agg_power_avg_w}W (from {total_energy_wms} W·ms / {total_latency_ms} ms)")
 
-        num_ctx_requests = np.ceil(ctx_tokens / isl)
+        # Requests prefilling in a mixed step: complete ones plus the partial
+        # request that fills a non-multiple budget, never more than the batch.
+        num_ctx_requests = min(np.ceil(ctx_budget / isl_new), float(b))
         num_gen_requests = b - num_ctx_requests
         if b == 1:
             num_ctx_requests = 1
@@ -1857,7 +1892,7 @@ class BaseBackend:
         if b > 1:
             # will not be corrected by balance score when it's larger than 1.0
             # in order to indicate what's happening
-            num_tokens = num_gen_requests + ctx_tokens
+            num_tokens = num_gen_requests + ctx_budget
             # Only the decode requests' tokens verify nextn+1 under speculative
             # decoding; the context share is processed once (see the MTP
             # correction in _get_memory_usage).
@@ -2089,6 +2124,9 @@ class BaseBackend:
         """
         isl = runtime_config.isl
         isl_eff = isl + self._visual_context_tokens(model, runtime_config)
+        # ctx_tokens budgets UNCACHED prefill tokens (run_agg's isl_new), so the
+        # feasibility guards and the capped-gen dedup pack requests by it.
+        isl_new = max(isl_eff - int(runtime_config.prefix or 0), 1)
         osl = runtime_config.osl
         ttft = runtime_config.ttft
         tpot = runtime_config.tpot
@@ -2122,7 +2160,10 @@ class BaseBackend:
         # during the loop, as b, ctx_tokens and system memory are monotonic, we can break the
         # inner loop when the system is oom.
         b_list = [b for b in b_list_default if b <= max_batch_size]
-        ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl_eff, ctx_stride, enable_chunked_prefill)
+        # The grid is built on isl_new too, so its points are multiples of the
+        # uncached prefill and the guards below admit the same (b, requests)
+        # shapes as at prefix 0.
+        ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl_new, ctx_stride, enable_chunked_prefill)
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
         results_dict_list: list[dict] = []
@@ -2131,16 +2172,16 @@ class BaseBackend:
         all_oom = True
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
-                if b - np.ceil(ctx_tokens / isl_eff) < 0:  # allow b==1
+                if b - np.ceil(ctx_tokens / isl_new) < 0:  # allow b==1
                     break
 
                 if b > 1 and (
-                    b - np.ceil(ctx_tokens / isl_eff) < 1
+                    b - np.ceil(ctx_tokens / isl_new) < 1
                 ):  # general case, to ensure there's at least one gen req
                     break
 
                 # filter out repeated records for balance score correction
-                balance_score = isl_eff * b / ctx_tokens / osl
+                balance_score = isl_new * b / ctx_tokens / osl
                 if balance_score > 1:
                     gen_tokens = b // balance_score
                     if gen_tokens > 1 and gen_tokens in capped_b:

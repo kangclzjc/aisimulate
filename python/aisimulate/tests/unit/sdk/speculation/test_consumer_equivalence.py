@@ -639,10 +639,10 @@ def test_mixed_draft_native_phases_match_independent_queries(real_database, ctx_
     assert not any(row[0].startswith("draft_") for row in shared)
     ctx_indices = [i for i, op in enumerate(model.context_ops) if op._name.startswith("draft_")]
     gen_indices = [i for i, op in enumerate(model.generation_ops) if op._name.startswith("draft_")]
+    # ctx_tokens budgets UNCACHED tokens: requests pack by isl - prefix.
+    isl_new = 4000 - prefix
     expected_context = (
-        handle.evaluate_context_ops(
-            ctx_indices, batch_size=math.ceil(ctx_tokens / 4000), s=4000 - prefix, prefix=prefix
-        )
+        handle.evaluate_context_ops(ctx_indices, batch_size=math.ceil(ctx_tokens / isl_new), s=isl_new, prefix=prefix)
         if ctx_tokens
         else []
     )
@@ -650,7 +650,7 @@ def test_mixed_draft_native_phases_match_independent_queries(real_database, ctx_
         handle.evaluate_generation_ops(gen_indices, batch_size=gen_requests * 4, s=4033) if gen_requests else []
     )
     for actual, expected, divisor in (
-        (context, expected_context, math.ceil(4000 / ctx_tokens) if ctx_tokens else 1),
+        (context, expected_context, math.ceil(isl_new / ctx_tokens) if ctx_tokens else 1),
         (generation, expected_generation, 1),
     ):
         drafts = {r[0]: r for r in actual if r[0].startswith("draft_")}

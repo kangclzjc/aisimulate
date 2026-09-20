@@ -325,6 +325,54 @@ def test_agg_estimate_responds_to_common_prefix():
     )
 
 
+def test_agg_estimate_explicit_isl_budget_prices_partial_requests_and_caps_at_the_batch():
+    """Explicit ``--ctx-tokens <ISL>`` (the pre-fix default) with a cached prefix.
+
+    The 2048-token budget of UNCACHED tokens holds one complete request of
+    ``2048 - prefix`` new tokens plus a partial request of ``prefix`` tokens.
+    The mixed step must price that partial request as such -- its context
+    attention lies strictly between one request's and two requests' static
+    context attention (two was the old ceil packing) -- the request counts
+    must never exceed the batch, and a half-cached batch finishes its prefill
+    in half the mixed steps: shorter TTFT and higher throughput than cold.
+    """
+    kwargs = _common_kwargs()
+    isl, batch_size = kwargs["isl"], kwargs["batch_size"]
+
+    def mixed_context_attention(result) -> float:
+        return result.summary.get_step_estimates()["mixed"].component_latency_ms["context_attention"]
+
+    def static_context_attention(prefill_batch_size: int, prefix: int) -> float:
+        static = cli_estimate(mode="static_ctx", prefix=prefix, **{**kwargs, "batch_size": prefill_batch_size})
+        return static.summary.get_context_latency_dict()["context_attention"]
+
+    cold = cli_estimate(mode="agg", prefix=0, ctx_tokens=isl, **kwargs)
+    assert (cold.raw["num_ctx_reqs"], cold.raw["num_gen_reqs"]) == (1, batch_size - 1)
+    assert mixed_context_attention(cold) == pytest.approx(static_context_attention(1, 0))
+    # Without a prefix the default budget is the isl: the explicit run is the default run.
+    assert cold.ttft == cli_estimate(mode="agg", prefix=0, **kwargs).ttft
+
+    warm = cli_estimate(mode="agg", prefix=128, ctx_tokens=isl, **kwargs)
+    assert (warm.raw["num_ctx_reqs"], warm.raw["num_gen_reqs"]) == (2, batch_size - 2)
+    assert static_context_attention(1, 128) < mixed_context_attention(warm) < static_context_attention(2, 128)
+
+    half = cli_estimate(mode="agg", prefix=isl // 2, ctx_tokens=isl, **kwargs)
+    assert (half.raw["num_ctx_reqs"], half.raw["num_gen_reqs"]) == (2, batch_size - 2)
+    # Exactly two complete requests: no partial request to price.
+    assert mixed_context_attention(half) == pytest.approx(static_context_attention(2, isl // 2))
+    assert half.ttft < cold.ttft
+    assert half.raw["tokens/s"] > cold.raw["tokens/s"]
+
+    nearly = cli_estimate(mode="agg", prefix=isl - 48, ctx_tokens=isl, **kwargs)
+    # 48 uncached tokens per request: the batch owns 4 * 48 = 192 of the
+    # 2048-token budget, so every request prefills at once and none decodes.
+    assert (nearly.raw["num_ctx_reqs"], nearly.raw["num_gen_reqs"]) == (batch_size, 0)
+    assert nearly.raw["num_tokens"] == batch_size * 48
+    assert nearly.raw["ctx_tokens"] == isl
+    assert nearly.ttft < half.ttft
+    assert nearly.raw["tokens/s"] > half.raw["tokens/s"]
+
+
 def test_agg_estimate_responds_to_common_nextn():
     """Regression: ``--nextn`` is now a common param. Toggling MTP on must
     visibly change the agg estimate; previously the kwarg was silently
