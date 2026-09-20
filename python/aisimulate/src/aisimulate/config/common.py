@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from pathlib import Path
-from typing import Annotated, Any, Generic, Literal, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -242,6 +242,28 @@ def is_active_engine_model_control(name: str, value: Any) -> bool:
     if name == "moe_backend":
         return value != "default"
     return True
+
+
+# Public ``engine.workers.<role>.kv_cache.dtype`` vocabulary; ``auto`` keeps the checkpoint inference.
+# Shared by the prediction/recommendation schemas and the sweeper SearchSpace fields.
+KvCacheDtype = Literal["auto", "bfloat16", "fp8"]
+
+
+def pinned_kv_cache_quant_modes(dtype: str) -> dict[str, str]:
+    """Lower ``kv_cache.dtype`` onto the canonical quant-mode controls.
+
+    ``bfloat16`` pins both the KV cache and FMHA to BF16: a BF16 cache never
+    runs the FP8 attention path that the weight quantization would otherwise
+    imply. ``fp8`` pins only the KV cache; FMHA keeps following the checkpoint
+    and backend resolution so backends without FP8 attention data stay on BF16.
+    """
+    if dtype == "auto":
+        return {}
+    if dtype == "bfloat16":
+        return {"kvcache_quant_mode": "bfloat16", "fmha_quant_mode": "bfloat16"}
+    if dtype == "fp8":
+        return {"kvcache_quant_mode": "fp8"}
+    raise ValueError(f"unsupported kv_cache.dtype {dtype!r}; expected one of {list(get_args(KvCacheDtype))}")
 
 
 def omit_inactive_moe_controls(config: dict[str, Any]) -> dict[str, Any]:

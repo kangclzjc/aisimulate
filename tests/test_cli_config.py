@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import logging
+from copy import deepcopy
+
 import pytest
 from pydantic import ValidationError
 
@@ -14,8 +17,9 @@ from aisimulate.config.engine import (
     WorkersPredictionConfig,
 )
 from aisimulate.recommend import _candidate_prediction, recommendation_to_sweeper
+from aisimulate.sweeper.config import SearchSpace
 from aisimulate.sweeper.deploy import build_backend_deployment
-from aisimulate.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+from aisimulate.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
 from aisimulate.sweeper.replay import ReplaySpec
 from aisimulate.sweeper.sample import unroll_sample
 
@@ -1359,3 +1363,364 @@ def test_role_systems_roots_reach_prediction_and_search_preflight(tmp_path, mode
     (branch,) = enumerate_branches(smart, max_seq_len=4096)
     assert branch.parallel_configs
     assert branch.deployment_mode == ("agg" if mode == "aggregated" else "disagg")
+
+
+_KV_DTYPE_MODEL = "Qwen/Qwen3-32B-FP8"  # fp8_block weights, no kv_cache_quant_algo: FP8 KV is inferred unless pinned
+_KV_DTYPE_TRANSFER = {"bytes_per_token": "auto", "bandwidth_gb_per_second": 400.0}
+_KV_DTYPE_MODES = ("aggregated", "disaggregated")
+_KV_DTYPE_ROLES = {"aggregated": ("agg",), "disaggregated": ("prefill", "decode")}
+# (dtype, canonical kvcache_quant_mode, canonical fmha_quant_mode) for the concrete pins.
+_KV_DTYPE_PINS = [("bfloat16", "bfloat16", "bfloat16"), ("fp8", "fp8", None)]
+_KV_DTYPE_ASSUMED = "assuming an FP8 KV cache"
+
+
+def _worker_name(role: str) -> str:
+    return "aggregated" if role == "agg" else role
+
+
+def _kv_dtype_engine(mode: str, dtype, *, recommend: bool, kv_cache_extra: dict | None, worker_overrides: dict) -> dict:
+    parallelism = (
+        {"preset": False, "tensor": 1, "attention_data": 1, "moe_tensor": 1, "moe_expert": 1}
+        if recommend
+        else {"tensor": 2}
+    )
+    worker = {"parallelism": parallelism, "kv_cache": {"dtype": dtype, **(kv_cache_extra or {})}, **worker_overrides}
+    engine = {
+        "model": _KV_DTYPE_MODEL,
+        "hardware": "h200_sxm",
+        "backend": "vllm",
+        "mode": mode,
+        "context_length": 4096,
+        "workers": {_worker_name(role): deepcopy(worker) for role in _KV_DTYPE_ROLES[mode]},
+    }
+    if mode == "disaggregated":
+        engine["kv_transfer"] = deepcopy(_KV_DTYPE_TRANSFER)
+    return engine
+
+
+def _kv_dtype_prediction(
+    dtype, mode: str = "aggregated", kv_cache_extra: dict | None = None, **worker_overrides
+) -> dict:
+    return {
+        "engine": _kv_dtype_engine(
+            mode, dtype, recommend=False, kv_cache_extra=kv_cache_extra, worker_overrides=worker_overrides
+        )
+    }
+
+
+def _kv_dtype_recommendation(
+    dtype, mode: str = "aggregated", kv_cache_extra: dict | None = None, **worker_overrides
+) -> dict:
+    return {
+        "engine": _kv_dtype_engine(
+            mode, dtype, recommend=True, kv_cache_extra=kv_cache_extra, worker_overrides=worker_overrides
+        ),
+        "optimization": {"constraints": {"max_candidate_gpus": 8}},
+    }
+
+
+_KV_DTYPE_SCHEMAS = [(CorePredictionConfig, _kv_dtype_prediction), (CoreRecommendationConfig, _kv_dtype_recommendation)]
+
+
+def _kv_dtype_sample(search_space, mode: str) -> dict:
+    shape = ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1)
+    if mode == "aggregated":
+        selection = {
+            "deployment_mode": "agg",
+            "backend": "vllm",
+            "agg_max_num_batched_tokens": 8192,
+            "agg_max_num_seqs": 256,
+        }
+        parallel = ReplicaParallelConfig(shape, replicas=1)
+    else:
+        selection = {
+            "deployment_mode": "disagg",
+            "backend": "vllm",
+            "prefill_max_num_batched_tokens": 8192,
+            "prefill_max_num_seqs": 4,
+            "decode_max_num_batched_tokens": 8192,
+            "decode_max_num_seqs": 256,
+        }
+        parallel = DisaggParallelConfig(
+            prefill=ReplicaParallelConfig(shape, replicas=1), decode=ReplicaParallelConfig(shape, replicas=1)
+        )
+    return unroll_sample(search_space=search_space, selection=selection, parallel_config=parallel)
+
+
+def _kv_dtype_estimators(search_space, sample: dict, roles: tuple[str, ...]) -> dict:
+    """Resolved canonical estimators carrying exactly the modes the resolver requested per role."""
+    from aisimulate.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
+    from aisimulate.sweeper.replay import ForwardPassEstimatorSpec
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig
+
+    resolver = ForwardPassEstimatorResolver(search_space)
+    estimators = {}
+    for role in roles:
+        request = resolver._request(sample, role)
+        estimators[role] = ForwardPassEstimatorSpec(
+            config=ForwardPassPerfModelConfig(
+                model=_KV_DTYPE_MODEL,
+                system="h200_sxm",
+                backend="vllm",
+                worker_type=_worker_name(role),
+                backend_version="test",
+                estimation_mode="op_level",
+                kvcache_quant_mode=request.kvcache_quant_mode,
+                fmha_quant_mode=request.fmha_quant_mode,
+            ).to_dict()
+        )
+    return estimators
+
+
+def _compiled_engine_args(raw: dict) -> dict[str, dict]:
+    from aisimulate.compiler import prediction_to_replay_spec
+
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment
+    return {role: getattr(deployment, f"{role}_engine_args") for role in _KV_DTYPE_ROLES[raw["engine"]["mode"]]}
+
+
+@pytest.mark.parametrize("mode", _KV_DTYPE_MODES)
+@pytest.mark.parametrize("dtype", ["auto", "bfloat16", "fp8"])
+def test_kv_cache_dtype_accepts_supported_values_in_predict_and_recommend(mode: str, dtype: str) -> None:
+    for schema, build in _KV_DTYPE_SCHEMAS:
+        config = schema.model_validate(build(dtype, mode))
+        for role in _KV_DTYPE_ROLES[mode]:
+            assert getattr(config.engine.workers, _worker_name(role)).kv_cache.dtype == dtype
+
+
+def test_kv_cache_dtype_defaults_to_auto() -> None:
+    config = CorePredictionConfig.model_validate({"engine": _engine()})
+    assert config.engine.workers.aggregated.kv_cache.dtype == "auto"
+
+
+@pytest.mark.parametrize("value", ["int8", "FP8", {"choices": ["fp8", "bfloat16"]}, True])
+def test_kv_cache_dtype_rejects_unsupported_values(value) -> None:
+    with pytest.raises(ValidationError, match="kv_cache.dtype"):
+        CorePredictionConfig.model_validate(_kv_dtype_prediction(value))
+    with pytest.raises(ValidationError, match="kv_cache.dtype"):
+        CoreRecommendationConfig.model_validate(_kv_dtype_recommendation(value))
+
+
+@pytest.mark.parametrize(("schema", "build"), _KV_DTYPE_SCHEMAS)
+@pytest.mark.parametrize("timing", [{"type": "fixed", "prefill_ms": 1, "decode_ms": 1}, {"type": "polynomial"}])
+def test_kv_cache_dtype_requires_default_timing(schema, build, timing: dict) -> None:
+    with pytest.raises(ValidationError, match="kv_cache.dtype requires default timing"):
+        schema.model_validate(build("bfloat16", timing=timing))
+
+
+def test_kv_cache_dtype_rejected_for_afd_and_encoder_pools() -> None:
+    # AFD decode combined with a regular prefill worker: the only AFD layout that carries a language worker.
+    afd = {
+        "engine": {
+            "mode": "afd",
+            "model": "Qwen/Qwen3-32B",
+            "hardware": "h200_sxm",
+            "backend": "trtllm",
+            "afd": {
+                "phase": "decode",
+                "combined_with_pd": True,
+                "n_a_nodes": 1,
+                "n_f_nodes": 1,
+                "tp_a": 8,
+                "a_batch_size": 8,
+            },
+            "workers": {"prefill": {"kv_cache": {"dtype": "bfloat16"}}},
+        }
+    }
+    with pytest.raises(ValidationError, match="kv_cache.dtype requires default timing"):
+        CorePredictionConfig.model_validate(afd)
+    afd["engine"]["workers"]["prefill"]["kv_cache"]["dtype"] = "auto"
+    CorePredictionConfig.model_validate(afd)
+
+    encoder = _kv_dtype_prediction("bfloat16")
+    encoder["engine"]["workers"]["encoder"] = {"tensor": 1, "replicas": 1, "batch_size": 1}
+    with pytest.raises(ValidationError, match="kv_cache.dtype requires default timing"):
+        CorePredictionConfig.model_validate(encoder)
+
+
+@pytest.mark.parametrize(("schema", "build"), _KV_DTYPE_SCHEMAS)
+@pytest.mark.parametrize("field", ["kvcache_quant_mode", "fmha_quant_mode"])
+def test_kv_cache_dtype_rejects_engine_wide_quant_mode_conflict(schema, build, field: str) -> None:
+    raw = build("bfloat16")
+    raw["engine"][field] = "fp8"
+    with pytest.raises(ValidationError, match="kv_cache.dtype conflicts"):
+        schema.model_validate(raw)
+    # ``auto`` is not a pin: the engine-wide spelling stays usable on its own.
+    raw = build("auto")
+    raw["engine"][field] = "fp8"
+    schema.model_validate(raw)
+
+
+@pytest.mark.parametrize(("schema", "build"), _KV_DTYPE_SCHEMAS)
+def test_kv_cache_dtype_must_match_across_prefill_and_decode(schema, build) -> None:
+    raw = build("bfloat16", "disaggregated")
+    raw["engine"]["workers"]["decode"]["kv_cache"]["dtype"] = "fp8"
+    with pytest.raises(ValidationError, match="must match across prefill and decode"):
+        schema.model_validate(raw)
+    raw["engine"]["workers"]["decode"]["kv_cache"]["dtype"] = "auto"
+    workers = schema.model_validate(raw).engine.workers
+    assert (workers.prefill.kv_cache.dtype, workers.decode.kv_cache.dtype) == ("bfloat16", "auto")
+
+
+def test_search_space_kv_cache_dtype_validators() -> None:
+    base = {"model_name": "example/model", "hardware_sku": "h200_sxm", "gpu_budget": 8}
+    with pytest.raises(ValidationError, match="kv_cache_dtype conflicts"):
+        SearchSpace(**base, agg_kv_cache_dtype="bfloat16", kvcache_quant_mode="fp8")
+    with pytest.raises(ValidationError, match="must match"):
+        SearchSpace(**base, prefill_kv_cache_dtype="bfloat16", decode_kv_cache_dtype="fp8")
+    with pytest.raises(ValidationError, match="require default timing"):
+        SearchSpace(
+            **base,
+            decode_kv_cache_dtype="bfloat16",
+            agg_timing_model={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+        )
+    assert (
+        SearchSpace(**base, prefill_kv_cache_dtype="fp8", decode_kv_cache_dtype="auto").prefill_kv_cache_dtype == "fp8"
+    )
+
+
+@pytest.mark.parametrize("mode", _KV_DTYPE_MODES)
+@pytest.mark.parametrize(("dtype", "expected_kv", "expected_fmha"), [("auto", None, None), *_KV_DTYPE_PINS])
+def test_kv_cache_dtype_lowers_to_canonical_timing_config(mode, dtype, expected_kv, expected_fmha) -> None:
+    from aisimulate.compiler import prediction_to_replay_spec
+
+    config = CorePredictionConfig.model_validate(_kv_dtype_prediction(dtype, mode))
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    for role in _KV_DTYPE_ROLES[mode]:
+        args = getattr(deployment, f"{role}_engine_args")
+        timing = args["timing_model"]["config"]
+        assert (timing["kvcache_quant_mode"], timing["fmha_quant_mode"]) == (expected_kv, expected_fmha)
+        # The worker's perf-model identity must agree with the timing config it was lowered into.
+        metadata = deployment.performance_model_metadata[_worker_name(role)]["config"]
+        assert (metadata.get("kvcache_quant_mode"), metadata.get("fmha_quant_mode")) == (expected_kv, expected_fmha)
+        # The canonical estimator config is the only carrier; no flat rank alias is emitted.
+        assert not {"kv_cache_dtype", "fmha_dtype", "aic_kv_cache_dtype", "aic_fmha_dtype"} & set(args)
+
+
+def test_kv_cache_dtype_steers_predict_kv_geometry() -> None:
+    """Host-offload and P/D-transfer bytes per token follow the pinned KV dtype (FP8 halves BF16)."""
+    offload = {"host_offload": {"num_host_blocks": 1024}}
+    agg = {
+        dtype: _compiled_engine_args(_kv_dtype_prediction(dtype, kv_cache_extra=offload))["agg"][
+            "kv_cache_bytes_per_token"
+        ]
+        for dtype in ("bfloat16", "fp8")
+    }
+    assert agg["bfloat16"] > 0
+    assert agg["fp8"] * 2 == agg["bfloat16"]
+
+    transfer = {
+        dtype: {
+            role: args["kv_transfer_bytes_per_token"]
+            for role, args in _compiled_engine_args(_kv_dtype_prediction(dtype, "disaggregated")).items()
+        }
+        for dtype in ("bfloat16", "fp8")
+    }
+    assert transfer["bfloat16"]["prefill"] == transfer["bfloat16"]["decode"] > 0
+    assert transfer["fp8"]["prefill"] == transfer["fp8"]["decode"]
+    assert transfer["fp8"]["prefill"] * 2 == transfer["bfloat16"]["prefill"]
+
+
+def test_kv_cache_dtype_steers_sweeper_kv_geometry() -> None:
+    """build_backend_deployment sizes host offload and P/D transfer from the role-pinned dtype."""
+
+    def deployment_for(dtype: str, mode: str, kv_cache_extra: dict | None = None):
+        config = CoreRecommendationConfig.model_validate(_kv_dtype_recommendation(dtype, mode, kv_cache_extra))
+        search_space = recommendation_to_sweeper(config).search_space
+        sample = _kv_dtype_sample(search_space, mode)
+        return build_backend_deployment(
+            sample,
+            backend_version="test",
+            forward_pass_estimators=_kv_dtype_estimators(search_space, sample, _KV_DTYPE_ROLES[mode]),
+        )
+
+    offload = {"host_offload": {"num_host_blocks": 1024}}
+    agg = {
+        dtype: deployment_for(dtype, "aggregated", offload).agg_engine_args["kv_cache_bytes_per_token"]
+        for dtype in ("bfloat16", "fp8")
+    }
+    assert agg["bfloat16"] > 0
+    assert agg["fp8"] * 2 == agg["bfloat16"]
+
+    transfer = {}
+    for dtype in ("bfloat16", "fp8"):
+        deployment = deployment_for(dtype, "disaggregated")
+        prefill = deployment.prefill_engine_args["kv_transfer_bytes_per_token"]
+        assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == prefill
+        transfer[dtype] = prefill
+    assert transfer["bfloat16"] > 0
+    assert transfer["fp8"] * 2 == transfer["bfloat16"]
+
+
+def test_kv_cache_dtype_requires_resolved_estimator_in_sweeper_payload() -> None:
+    smart = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(_kv_dtype_recommendation("bfloat16")))
+    sample = _kv_dtype_sample(smart.search_space, "aggregated")
+    with pytest.raises(ValueError, match="resolved canonical forward-pass estimator"):
+        build_backend_deployment(sample, backend_version="test")
+
+
+@pytest.mark.parametrize("mode", _KV_DTYPE_MODES)
+@pytest.mark.parametrize(("dtype", "expected_kv", "expected_fmha"), _KV_DTYPE_PINS)
+def test_kv_cache_dtype_round_trips_through_recommendation_candidate(mode, dtype, expected_kv, expected_fmha) -> None:
+    from aisimulate.compiler import prediction_to_replay_spec
+    from aisimulate.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
+
+    roles = _KV_DTYPE_ROLES[mode]
+    config = CoreRecommendationConfig.model_validate(_kv_dtype_recommendation(dtype, mode))
+    smart = recommendation_to_sweeper(config)
+    assert smart.search_space.kvcache_quant_mode is None
+    assert smart.search_space.fmha_quant_mode is None
+    for role in roles:
+        assert getattr(smart.search_space, f"{role}_kv_cache_dtype") == dtype
+
+    sample = _kv_dtype_sample(smart.search_space, mode)
+    resolver = ForwardPassEstimatorResolver(smart.search_space)
+    for role in roles:
+        assert sample[f"{role}_kv_cache_dtype"] == dtype
+        request = resolver._request(sample, role)
+        assert (request.kvcache_quant_mode, request.fmha_quant_mode) == (expected_kv, expected_fmha)
+
+    deployment = build_backend_deployment(
+        sample, backend_version="test", forward_pass_estimators=_kv_dtype_estimators(smart.search_space, sample, roles)
+    )
+    prediction = _candidate_prediction(
+        config, sample, ReplaySpec(backend_deployment=deployment, workload={}, goal={}), adapter_sections={}
+    )
+    assert "kvcache_quant_mode" not in prediction["engine"]
+    assert "fmha_quant_mode" not in prediction["engine"]
+    replay = prediction_to_replay_spec(CorePredictionConfig.model_validate(prediction)).backend_deployment
+    for role in roles:
+        assert prediction["engine"]["workers"][_worker_name(role)]["kv_cache"]["dtype"] == dtype
+        assert getattr(deployment, f"{role}_engine_args")["timing_model"]["config"]["kvcache_quant_mode"] == expected_kv
+        timing = getattr(replay, f"{role}_engine_args")["timing_model"]["config"]
+        assert (timing["kvcache_quant_mode"], timing["fmha_quant_mode"]) == (expected_kv, expected_fmha)
+
+
+@pytest.mark.parametrize("mode", _KV_DTYPE_MODES)
+def test_kv_cache_dtype_pin_reaches_parallel_feasibility_prefilter(mode: str, monkeypatch, caplog) -> None:
+    """The per-role pin sizes the KV pre-filter like the engine-wide spelling and silences the inferred-FP8 warning."""
+    from aisimulate.sweeper.search_space import _engine_memory_kwargs, enumerate_branches
+    from aisimulate_core.sdk.models import helpers as model_helpers
+
+    roles = _KV_DTYPE_ROLES[mode]
+    pinned = {"kvcache_quant_mode": "bfloat16", "fmha_quant_mode": "bfloat16"}
+    per_role = recommendation_to_sweeper(
+        CoreRecommendationConfig.model_validate(_kv_dtype_recommendation("bfloat16", mode))
+    )
+    engine_wide_raw = _kv_dtype_recommendation("auto", mode)
+    engine_wide_raw["engine"].update(pinned)
+    engine_wide = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(engine_wide_raw))
+
+    role_map = dict(zip(roles, roles, strict=True))
+    assert _engine_memory_kwargs(per_role.search_space, role_map) == {
+        "role_model_controls": dict.fromkeys(roles, pinned)
+    }
+    assert _engine_memory_kwargs(engine_wide.search_space, role_map) == {"model_controls": pinned}
+
+    monkeypatch.setattr(model_helpers, "_INFERRED_FP8_KV_WARNED", set())
+    with caplog.at_level(logging.WARNING, logger="aisimulate_core.sdk.models.helpers"):
+        (per_role_branch,) = enumerate_branches(per_role, max_seq_len=4096)
+    assert _KV_DTYPE_ASSUMED not in caplog.text
+    (engine_wide_branch,) = enumerate_branches(engine_wide, max_seq_len=4096)
+    assert per_role_branch.parallel_configs
+    assert per_role_branch.parallel_configs == engine_wide_branch.parallel_configs

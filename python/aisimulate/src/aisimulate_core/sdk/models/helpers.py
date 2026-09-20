@@ -586,6 +586,70 @@ def _infer_mixed_precision_quant_modes(raw_config: dict, quant_dynamic: bool | N
     return overrides
 
 
+# Weight quantizations whose checkpoints are assumed to serve an FP8 KV cache
+# when they declare no kv_cache_quant_algo.
+_FP8_KV_INFERENCE_QUANT_ALGOS = frozenset({"fp8", "fp8_block", "nvfp4"})
+# Architectures whose sparse attention requires an FP8 KV cache regardless of declaration.
+_FP8_KV_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"})
+_INFERRED_FP8_KV_WARNED: set[tuple[str | None, str]] = set()
+
+
+def _raw_config_architecture(raw_config: dict) -> str | None:
+    architectures = raw_config.get("architectures") or []
+    return architectures[0] if architectures else raw_config.get("architecture")
+
+
+def kv_cache_dtype_is_inferred(raw_config: dict, architecture: str | None = None) -> bool:
+    """True when FP8 KV is assumed from the weight quantization, not declared by the checkpoint."""
+    if architecture is None:
+        architecture = _raw_config_architecture(raw_config)
+    return (
+        raw_config.get("kv_cache_quant_algo") is None
+        and raw_config.get("quant_algo") in _FP8_KV_INFERENCE_QUANT_ALGOS
+        and architecture not in _FP8_KV_ARCHITECTURES
+    )
+
+
+def warn_inferred_fp8_kv_cache(
+    raw_config: dict,
+    architecture: str | None = None,
+    *,
+    fmha_quant_mode: Optional[common.FMHAQuantMode] = None,
+) -> None:
+    """Warn once per checkpoint kind that the FP8 KV cache mode was assumed.
+
+    Call this only after the inferred FP8 KV mode was actually applied, i.e.
+    when the caller did not pin ``kvcache_quant_mode`` explicitly. Pass the
+    resolved ``fmha_quant_mode`` when it is already final so the message states
+    the attention mode that will actually be modeled (backends without FP8
+    attention data downgrade FMHA to BF16 even with an FP8 KV cache).
+    """
+    if architecture is None:
+        architecture = _raw_config_architecture(raw_config)
+    if not kv_cache_dtype_is_inferred(raw_config, architecture):
+        return
+    quant_algo = str(raw_config.get("quant_algo"))
+    key = (architecture, quant_algo)
+    if key in _INFERRED_FP8_KV_WARNED:
+        return
+    _INFERRED_FP8_KV_WARNED.add(key)
+    fmha_note = (
+        f"FMHA resolved to {fmha_quant_mode.name}"
+        if fmha_quant_mode is not None
+        else "FMHA follows the backend's attention data: FP8 where available, otherwise bfloat16"
+    )
+    logger.warning(
+        "%s checkpoint (quant_algo=%s) declares no kv_cache_quant_algo; assuming an FP8 KV cache from the weight "
+        "quantization (%s). SGLang and vLLM serve --kv-cache-dtype auto as the model dtype (bfloat16), and "
+        "TensorRT-LLM uses FP8 KV only when hf_quant_config declares kv_cache_quant_algo=FP8. Pin the dtype with "
+        "engine.workers.<role>.kv_cache.dtype (aisimulate YAML) or --kvcache-quant-mode/--fmha-quant-mode "
+        "(legacy aiconfigurator CLI).",
+        architecture or "The",
+        quant_algo,
+        fmha_note,
+    )
+
+
 def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | None = None) -> dict[str, object]:
     quant_algo = raw_config.get("quant_algo")
     quant_dynamic = raw_config.get("quant_dynamic")
@@ -649,7 +713,9 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
     ):
         overrides["moe_quant_mode"] = common.MoEQuantMode.w4a8_mxfp4_mxfp8
 
-    # KVCache quant mode
+    # KVCache quant mode. An explicit checkpoint declaration always wins; only
+    # an undeclared KV dtype on an FP8/NVFP4 checkpoint is assumed FP8 (see
+    # warn_inferred_fp8_kv_cache for the caveat behind that assumption).
     # TODO: support fp4 kv cache
     if kv_cache_algo == "fp8":
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
@@ -657,16 +723,21 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.bfloat16
     elif kv_cache_algo is not None:
         raise ValueError(f"Unsupported kv cache algorithm: {kv_cache_algo}")
-
-    # DSV4 sparse attention requires FP8 KV cache across all backends.
-    if architecture in {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}:
+    elif quant_algo in _FP8_KV_INFERENCE_QUANT_ALGOS:
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
-    # FMHA quant mode
-    if quant_algo is not None and (quant_algo in ("fp8", "fp8_block", "nvfp4") or kv_cache_algo in ("fp8",)):
+    # DSV4 sparse attention requires FP8 KV cache across all backends.
+    if architecture in _FP8_KV_ARCHITECTURES:
+        overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
+
+    # FMHA follows the KV decision: FP8 attention only when a quantized
+    # checkpoint ends up with an FP8 KV cache; a BF16 KV cache keeps BF16 FMHA.
+    if (
+        quant_algo is not None
+        and (quant_algo in _FP8_KV_INFERENCE_QUANT_ALGOS or kv_cache_algo == "fp8")
+        and overrides.get("kvcache_quant_mode") == common.KVCacheQuantMode.fp8
+    ):
         overrides["fmha_quant_mode"] = common.FMHAQuantMode.fp8
-        if kv_cache_algo is None or kv_cache_algo != "fp8":
-            overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
     return overrides
 
@@ -720,6 +791,7 @@ def _apply_model_quant_defaults(
     original_config = dataclasses.replace(model_config)
     fmha_was_unset = model_config.fmha_quant_mode is None
     moe_was_unset = model_config.moe_quant_mode is None
+    kvcache_was_unset = model_config.kvcache_quant_mode is None
 
     inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
     applied: list[str] = []
@@ -766,6 +838,10 @@ def _apply_model_quant_defaults(
         # VLLM perf tables only include bfloat16 FMHA; fall back to bfloat16 for estimation.
         if backend_name == "vllm" and model_config.fmha_quant_mode == common.FMHAQuantMode.fp8:
             model_config.fmha_quant_mode = common.FMHAQuantMode.bfloat16
+
+    # Warn only once FMHA is final so the message reports the attention mode actually modeled.
+    if kvcache_was_unset and model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8:
+        warn_inferred_fp8_kv_cache(raw_config, architecture, fmha_quant_mode=model_config.fmha_quant_mode)
 
     # Inferred-mode-only remap (see resolve_vllm_moe_execution_mode): an
     # explicit user mode wins, and validate fails fast on it — the

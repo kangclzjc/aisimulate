@@ -127,6 +127,7 @@ def parallel_configs_for(
     role_runtime: dict[str, tuple[int, int, float] | tuple[int, int, float, int | None]] | None = None,
     systems_paths: list[str] | None = None,
     model_controls: dict[str, str | int | bool] | None = None,
+    role_model_controls: dict[str, dict[str, str | int | bool]] | None = None,
     nextn: int = 0,
 ) -> list[ReplicaParallelConfig] | list[DisaggParallelConfig]:
     """Resolve the model/hardware, then enumerate the parallel configs that fit
@@ -141,6 +142,10 @@ def parallel_configs_for(
     ``max_seq_len`` defaults to the model's max context length (the engine's
     ``max_model_len`` -> the longest sequence any request can occupy); pass a
     smaller value only to tune for a workload known to be shorter.
+
+    ``model_controls`` applies to every role; ``role_model_controls`` maps a role
+    (``agg``/``prefill``/``decode``) to controls layered on top of it, so a
+    role-pinned KV dtype sizes the feasibility check like the candidate itself.
 
     ``deployment_mode`` is ``"agg"`` (-> ``list[ReplicaParallelConfig]``) or
     ``"disagg"`` (-> ``list[DisaggParallelConfig]``). Raises
@@ -190,6 +195,7 @@ def parallel_configs_for(
             )
         if fixed_tokens is not None:
             return {shape: fixed_tokens for shape in dict.fromkeys(shapes) if fixed_tokens > seq_len}
+        controls = {**(model_controls or {}), **((role_model_controls or {}).get(role) or {})}
         return feasible_shape_tokens(
             shapes,
             model_name=model_name,
@@ -201,7 +207,7 @@ def parallel_configs_for(
             max_num_tokens=role_tokens,
             max_batch_size=role_batch,
             memory_fraction=role_memory,
-            **({"model_controls": model_controls} if model_controls else {}),
+            **({"model_controls": controls} if controls else {}),
             **({"nextn": nextn} if nextn else {}),
         )
 

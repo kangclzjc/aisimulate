@@ -50,6 +50,7 @@ from aisimulate.sdk.models import (
     resolve_dsv4_moe_arch_mode,
     resolve_kimi_k3_moe_arch_mode,
     resolve_vllm_moe_execution_mode,
+    warn_inferred_fp8_kv_cache,
 )
 from aisimulate.sdk.models.blocks.moe import LARGE_EP_READY_FAMILIES, MoEBlockShape
 from aisimulate.sdk.models.helpers import resolve_sglang_mla_compute
@@ -1177,6 +1178,8 @@ class Task:
                     continue
                 resolved = from_hf if from_hf is not None else fallback
                 self._set_role_attr(role, key, resolved)
+                if key == "kvcache_quant_mode" and resolved == common.KVCacheQuantMode.fp8:
+                    warn_inferred_fp8_kv_cache(self._raw_config)
 
         if self.serving_mode == "afd" and self.afd_combined_with_pd:
             # Static prefill inherits the aggregate mode unless overridden.

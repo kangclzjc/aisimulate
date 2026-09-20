@@ -13,6 +13,7 @@ from .common import (
     ENGINE_MODEL_CONTROL_FIELDS,
     Choices,
     IntegerRange,
+    KvCacheDtype,
     NumericRange,
     StrictModel,
     is_active_engine_model_control,
@@ -133,6 +134,7 @@ class G3OffloadConfig(StrictModel):
 class KvCachePredictionConfig(StrictModel):
     block_size: PositiveInt | None = None
     prefix_caching: bool = True
+    dtype: KvCacheDtype = "auto"
     bytes_per_token: KvBytesPerToken = "auto"
     capacity: KvCapacityPredictionConfig = Field(default_factory=KvCapacityPredictionConfig)
     host_offload: HostOffloadConfig | None = None
@@ -289,11 +291,23 @@ class EstimatorPolicyConfig(StrictModel):
             raise ValueError("enable_chunked_prefill is unsupported for AFD")
         workers = getattr(self, "workers", None)
         roles = [getattr(workers, role, None) for role in ("aggregated", "prefill", "decode")]
-        if active and (
+        pinned_kv_dtype = any(worker is not None and worker.kv_cache.dtype != "auto" for worker in roles)
+        if pinned_kv_dtype and (self.kvcache_quant_mode is not None or self.fmha_quant_mode is not None):
+            raise ValueError(
+                "kv_cache.dtype conflicts with engine.kvcache_quant_mode/engine.fmha_quant_mode; set only one of them"
+            )
+        # One KV cache is transferred between the P/D roles, so its dtype cannot differ per role.
+        pd_dtypes = {worker.kv_cache.dtype for worker in roles[1:] if worker is not None} - {"auto"}
+        if len(pd_dtypes) > 1:
+            raise ValueError("kv_cache.dtype must match across prefill and decode workers (or stay auto on one side)")
+        unsupported_timing = (
             "afd" in modes
             or getattr(workers, "encoder", None) is not None
             or any(worker is not None and worker.timing.type != "default" for worker in roles)
-        ):
+        )
+        if pinned_kv_dtype and unsupported_timing:
+            raise ValueError("kv_cache.dtype requires default timing on regular language workers")
+        if active and unsupported_timing:
             raise ValueError("engine model controls require default timing in every regular language role")
         return self
 
@@ -523,6 +537,7 @@ class KvCapacityRecommendationConfig(StrictModel):
 class KvCacheRecommendationConfig(StrictModel):
     block_size: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
     prefix_caching: bool = True
+    dtype: KvCacheDtype = "auto"
     bytes_per_token: KvBytesPerToken = "auto"
     capacity: KvCapacityRecommendationConfig = Field(default_factory=KvCapacityRecommendationConfig)
     host_offload: HostOffloadConfig | None = None

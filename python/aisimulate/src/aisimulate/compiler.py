@@ -14,7 +14,7 @@ from .capacity import (
     resolve_model_context_length,
 )
 from .config.cli import CorePredictionConfig
-from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_controls
+from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_controls, pinned_kv_cache_quant_modes
 from .config.engine import EnginePredictionConfig, WorkerPredictionConfig
 from .config.traffic import SyntheticSessionSource, SyntheticSource, TraceSource
 from .sweeper.afd_parallel import AFDParallelConfig, AFDTopology
@@ -377,9 +377,12 @@ def _worker_performance_model_metadata(
             **({"speculation": engine.speculation.cost_config()} if engine.speculation is not None else {}),
             "forward_model": worker.timing.forward_model,
             **{
-                name: getattr(engine, name)
-                for name in ENGINE_MODEL_CONTROL_FIELDS
-                if getattr(engine, name) not in (None, False)
+                name: value
+                for name, value in {
+                    **{name: getattr(engine, name) for name in ENGINE_MODEL_CONTROL_FIELDS},
+                    **pinned_kv_cache_quant_modes(worker.kv_cache.dtype),
+                }.items()
+                if value not in (None, False)
             },
             **({"decoder_replay": True} if engine.decoder_replay else {}),
             **{
@@ -487,6 +490,11 @@ def _worker_engine_args(
 
         timing = worker.timing
         sharded_moe = parallel.moe_tensor * parallel.moe_expert > 1
+        # The role's kv_cache.dtype is a caller-side spelling of the canonical
+        # KV/FMHA quant-mode controls; the schema forbids mixing it with the
+        # engine-wide fields, so the pinned modes simply replace the None slots.
+        model_controls = {name: getattr(engine, name) for name in ENGINE_MODEL_CONTROL_FIELDS}
+        model_controls.update(pinned_kv_cache_quant_modes(cache.dtype))
         canonical = ForwardPassPerfModelConfig(
             model=engine.model,
             system=worker.hardware or engine.hardware,
@@ -503,7 +511,7 @@ def _worker_engine_args(
             moe_ep_size=parallel.moe_expert if sharded_moe else None,
             kv_block_size=block_size,
             nextn=engine.nextn,
-            **{name: getattr(engine, name) for name in ENGINE_MODEL_CONTROL_FIELDS},
+            **model_controls,
             speculation=engine.speculation.cost_config() if engine.speculation is not None else None,
             estimation_mode=timing.estimation_mode or engine.estimation_mode,
             fallback_policy=timing.fallback_policy or engine.fallback_policy,
@@ -563,13 +571,16 @@ def _resolve_kv_bytes_per_token(
     if configured != "auto":
         return configured
     parallel = worker.parallelism
+    kvcache_quant_mode = pinned_kv_cache_quant_modes(worker.kv_cache.dtype).get(
+        "kvcache_quant_mode", engine.kvcache_quant_mode
+    )
     return estimate_kv_bytes_per_token(
         engine.model,
         tp_size=parallel.tensor,
         pp_size=parallel.pipeline,
         moe_tp_size=parallel.moe_tensor,
         moe_ep_size=parallel.moe_expert,
-        **({"kvcache_quant_mode": engine.kvcache_quant_mode} if engine.kvcache_quant_mode else {}),
+        **({"kvcache_quant_mode": kvcache_quant_mode} if kvcache_quant_mode else {}),
     )
 
 

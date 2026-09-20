@@ -250,3 +250,50 @@ def test_kv_path_tiny_budget_raises():
             backend="trtllm",
             max_seq_len=8192,
         )
+
+
+def test_role_model_controls_layer_over_shared_controls(monkeypatch):
+    """A role-pinned KV dtype reaches the KV pre-filter of that role only, on top of the shared controls."""
+    monkeypatch.setattr(
+        mh_mod,
+        "resolve_model_hardware",
+        lambda *args, **kwargs: ModelHardware(
+            model_name="model",
+            hardware_sku="hardware",
+            backend="vllm",
+            is_moe=False,
+            mla=False,
+            enable_wideep=False,
+            weight_bytes=1,
+            vram_per_gpu=80,
+            gpus_per_node=8,
+            max_context=2048,
+        ),
+    )
+    controls_by_batch: dict[int, dict | None] = {}
+
+    def fake_feasible(shapes, **kwargs):
+        controls_by_batch[kwargs["max_batch_size"]] = kwargs.get("model_controls")
+        return dict.fromkeys(shapes, 4096)
+
+    monkeypatch.setattr(mh_mod, "feasible_shape_tokens", fake_feasible)
+
+    configs = parallel_configs_for(
+        "model",
+        "hardware",
+        gpu_budget=2,
+        deployment_mode="disagg",
+        backend="vllm",
+        max_seq_len=1024,
+        role_runtime={"prefill": (4096, 4, 0.9), "decode": (4096, 256, 0.9)},
+        model_controls={"moe_backend": "cutlass"},
+        role_model_controls={"decode": {"kvcache_quant_mode": "bfloat16", "fmha_quant_mode": "bfloat16"}},
+    )
+
+    assert configs
+    assert controls_by_batch[4] == {"moe_backend": "cutlass"}
+    assert controls_by_batch[256] == {
+        "moe_backend": "cutlass",
+        "kvcache_quant_mode": "bfloat16",
+        "fmha_quant_mode": "bfloat16",
+    }

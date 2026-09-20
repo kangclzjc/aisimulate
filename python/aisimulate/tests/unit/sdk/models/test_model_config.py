@@ -8,6 +8,7 @@ Tests model validation, default models, and model-specific configurations.
 """
 
 import json
+import logging
 from collections import Counter
 from typing import ClassVar
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from aisimulate.sdk.models import (
     get_model,
     get_model_family,
 )
+from aisimulate.sdk.models import helpers as model_helpers
 from aisimulate.sdk.performance_result import PerformanceResult
 from aisimulate.sdk.utils import get_model_config_from_model_path
 
@@ -1137,6 +1139,92 @@ class TestQuantizationModes:
 
         assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
         assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
+class TestKVCacheDtypeInference:
+    """Checkpoint KV-cache declarations win; FP8 KV is only assumed when undeclared."""
+
+    _ARCH = "Qwen3_5MoeForConditionalGeneration"
+    _LOGGER = "aisimulate_core.sdk.models.helpers"
+    _ASSUMED = "assuming an FP8 KV cache"
+
+    @pytest.fixture(autouse=True)
+    def _reset_warning_dedup(self, monkeypatch):
+        monkeypatch.setattr(model_helpers, "_INFERRED_FP8_KV_WARNED", set())
+
+    def test_explicit_bfloat16_kv_cache_wins_over_fp8_block_weights(self, caplog):
+        raw = {"quant_algo": "fp8_block", "kv_cache_quant_algo": "bfloat16", "architectures": [self._ARCH]}
+        overrides = models._infer_quant_modes_from_raw_config(raw)
+        assert overrides["kvcache_quant_mode"] == common.KVCacheQuantMode.bfloat16
+        assert "fmha_quant_mode" not in overrides
+
+        model_config = config.ModelConfig()
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            models._apply_model_quant_defaults(model_config, raw, self._ARCH, "sglang")
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.bfloat16
+        assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+        assert self._ASSUMED not in caplog.text
+
+    def test_explicit_fp8_kv_cache_is_kept(self):
+        overrides = models._infer_quant_modes_from_raw_config({"quant_algo": "fp8", "kv_cache_quant_algo": "fp8"})
+        assert overrides["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+        assert overrides["fmha_quant_mode"] == common.FMHAQuantMode.fp8
+
+    def test_undeclared_fp8_block_infers_fp8_and_warns_once(self, caplog):
+        raw = {"quant_algo": "fp8_block", "architectures": [self._ARCH]}
+        overrides = models._infer_quant_modes_from_raw_config(raw)
+        assert overrides["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+        assert overrides["fmha_quant_mode"] == common.FMHAQuantMode.fp8
+        assert model_helpers.kv_cache_dtype_is_inferred(raw)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            for _ in range(2):
+                model_config = config.ModelConfig()
+                models._apply_model_quant_defaults(model_config, raw, self._ARCH, "sglang")
+                assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+                assert model_config.fmha_quant_mode == common.FMHAQuantMode.fp8
+        assumed = [record.getMessage() for record in caplog.records if self._ASSUMED in record.getMessage()]
+        assert len(assumed) == 1
+        assert "quant_algo=fp8_block" in assumed[0]
+        assert "FMHA resolved to fp8" in assumed[0]
+        assert "--kv-cache-dtype auto" in assumed[0]
+        assert "kv_cache.dtype" in assumed[0] and "--kvcache-quant-mode" in assumed[0]
+
+    def test_warning_reports_downgraded_fmha_on_vllm(self, caplog):
+        """The message states the FMHA mode actually modeled, not an FP8 claim the backend guard undid."""
+        raw = {"quant_algo": "fp8_block", "architectures": [self._ARCH]}
+        model_config = config.ModelConfig()
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            models._apply_model_quant_defaults(model_config, raw, self._ARCH, "vllm")
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+        assert model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+        (assumed,) = [record.getMessage() for record in caplog.records if self._ASSUMED in record.getMessage()]
+        assert "FMHA resolved to bfloat16" in assumed
+        assert "FP8 FMHA" not in assumed
+
+    def test_explicit_user_kv_cache_mode_suppresses_warning(self, caplog):
+        raw = {"quant_algo": "fp8_block", "architectures": [self._ARCH]}
+        model_config = config.ModelConfig(kvcache_quant_mode=common.KVCacheQuantMode.bfloat16)
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            models._apply_model_quant_defaults(model_config, raw, self._ARCH, "sglang")
+        assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.bfloat16
+        assert self._ASSUMED not in caplog.text
+
+    def test_nvfp4_modelopt_fp8_kv_declaration_is_unchanged(self):
+        raw = {"quant_algo": "nvfp4", "kv_cache_quant_algo": "fp8"}
+        overrides = models._infer_quant_modes_from_raw_config(raw)
+        assert overrides["gemm_quant_mode"] == common.GEMMQuantMode.nvfp4
+        assert overrides["moe_quant_mode"] == common.MoEQuantMode.nvfp4
+        assert overrides["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+        assert overrides["fmha_quant_mode"] == common.FMHAQuantMode.fp8
+        assert not model_helpers.kv_cache_dtype_is_inferred(raw)
+
+    def test_deepseek_v4_architectural_fp8_kv_is_not_reported_as_inferred(self):
+        raw = {"quant_algo": "fp8_block", "architectures": ["DeepseekV4ForCausalLM"]}
+        overrides = models._infer_quant_modes_from_raw_config(raw, "DeepseekV4ForCausalLM")
+        assert overrides["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+        assert overrides["fmha_quant_mode"] == common.FMHAQuantMode.fp8
+        assert not model_helpers.kv_cache_dtype_is_inferred(raw, "DeepseekV4ForCausalLM")
 
 
 class TestMOEModelFP8BlockQuantizationValidation:

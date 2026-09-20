@@ -955,6 +955,7 @@ engine:
       kv_cache:
         block_size: 64
         prefix_caching: true
+        dtype: auto
         bytes_per_token: auto
         capacity:
           type: default
@@ -999,6 +1000,7 @@ engine:
 | `engine.workers.<role>.scheduler.prefill_schedule_interval` | `1` | `x` | `-` | `predict` only. Positive. Values above one throttle prefill admission only for vLLM attention-DP groups. |
 | `engine.workers.<role>.kv_cache.block_size` | vLLM `64`; SGLang `1`; TensorRT-LLM `32` | `-` | `-` | Positive and backend-supported. Defaults are backend-specific, not version-specific. |
 | `engine.workers.<role>.kv_cache.prefix_caching` | `true` | `x` | `-` | Backend-supported. |
+| `engine.workers.<role>.kv_cache.dtype` | `auto` | `x` | `-` | `auto`, `bfloat16`, or `fp8`. `auto` follows the checkpoint (see below). `bfloat16` pins the KV cache and FMHA to BF16; `fp8` pins the KV cache to FP8 and lets FMHA follow the checkpoint and backend data. `default` timing only; cannot be combined with `engine.kvcache_quant_mode`/`engine.fmha_quant_mode`; prefill and decode must pin the same dtype (one side may stay `auto`). |
 | `engine.workers.<role>.kv_cache.bytes_per_token` | `auto` | `x` | `-` | Positive when concrete. `auto` resolves once per worker role from the model and that role's TP/PP/MoE shape. |
 | `engine.workers.<role>.kv_cache.capacity.type` | `default` | `x` | `-` | `default` or `fixed`. |
 | `engine.workers.<role>.kv_cache.capacity.memory_fraction` | vLLM/TensorRT-LLM `0.9`; SGLang `0.88` | `-` | `-` | `(0, 1]`; `default` capacity only. |
@@ -1024,6 +1026,16 @@ engine:
 | `engine.afd.pipeline_model` | `optimistic` for prediction | `{choices: [optimistic, conservative]}` | `-` | `optimistic`, `conservative`, or `serial`. |
 | `engine.afd.comm_overhead_factor` | `1.0` | `x` | `-` | Positive factor applied once by the AFD evaluator. |
 | `engine.afd.boundary_on_attn` | `true` | `x` | `-` | Fixed A/F boundary convention. |
+
+`engine.workers.<role>.kv_cache.dtype: auto` follows the checkpoint: an explicit `kv_cache_quant_algo`
+(`hf_quant_config.json` or `quantization_config`) always wins, and FP8/NVFP4 weights that declare no
+KV dtype are assumed to serve an FP8 KV cache (logged once per run, together with the FMHA mode the
+backend data resolved to: FP8 where the backend has FP8 attention data, otherwise BF16). SGLang and
+vLLM default `--kv-cache-dtype auto` to the model dtype (BF16), and TensorRT-LLM uses FP8 KV only when
+the ModelOpt `hf_quant_config` declares it, so pin `bfloat16` to reproduce such a deployment of an FP8
+checkpoint. The pinned modes are passed through the canonical performance-model configuration in both
+`predict` and `recommend` (candidate timing, KV capacity, the parallel-feasibility pre-filter, and the
+worker's performance-model metadata); the default inference itself is unchanged.
 
 `engine.hardware: auto` is valid only in `recommend` and requires the single hardware identifier under
 `optimization.hardware`. Every recommended prediction YAML replaces `auto` with that concrete

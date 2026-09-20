@@ -424,6 +424,7 @@ def _role_search_space(
         else:
             result[memory_name] = memory_value
         result[f"{legacy_role}_enable_prefix_caching"] = cache.get("prefix_caching", True)
+        result[f"{legacy_role}_kv_cache_dtype"] = cache.get("dtype", "auto")
         result[f"{legacy_role}_kv_bytes_per_token"] = cache.get("bytes_per_token", "auto")
         result[f"{legacy_role}_native_host_offload"] = deepcopy(cache.get("host_offload"))
         capacity_type = capacity.get("type", "default")
@@ -877,6 +878,7 @@ def _candidate_prediction(
         kv_cache = {
             "block_size": block_size,
             "prefix_caching": sample[f"{role}_enable_prefix_caching"],
+            "dtype": sample.get(f"{role}_kv_cache_dtype", "auto"),
             "bytes_per_token": sample[f"{role}_kv_bytes_per_token"],
             "capacity": capacity,
         }

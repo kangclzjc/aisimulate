@@ -555,7 +555,7 @@ selection and fallback policy.
 | Chunked prefill | `engine.enable_chunked_prefill` (omit for backend default) |
 | EPLB and redundant expert slots | `engine.enable_eplb`, `engine.wideep_num_slots` |
 | MoE and attention kernel backends | `engine.moe_backend`, `engine.attention_backend` |
-| Quantization overrides | `engine.gemm_quant_mode`, `engine.moe_quant_mode`, `engine.kvcache_quant_mode`, `engine.fmha_quant_mode`, `engine.comm_quant_mode` |
+| Quantization overrides | `engine.gemm_quant_mode`, `engine.moe_quant_mode`, `engine.kvcache_quant_mode`, `engine.fmha_quant_mode`, `engine.comm_quant_mode`; `--kvcache-quant-mode bfloat16 --fmha-quant-mode bfloat16` also maps to the per-role `engine.workers.<role>.kv_cache.dtype: bfloat16` |
 | Exact synthetic shared prefix | `traffic.source.cached_prefix_tokens` |
 | Maximum sequence length | Existing `engine.context_length` |
 | GPU memory fraction | Existing `engine.workers.<role>.kv_cache.capacity.memory_fraction` |
@@ -1474,7 +1474,10 @@ aiconfigurator cli estimate \
 **Result to inspect:** the printed configuration and timing/source breakdown use the requested
 settings. Supported selectors depend on the backend and data. For serving simulation, pin the
 same supported quantization and kernel selectors through the unified `engine` fields in
-[section 4.6.3](#preserve-pinned-engine-and-request-controls). The static estimate and source
+[section 4.6.3](#preserve-pinned-engine-and-request-controls). To serve an FP8 checkpoint with the
+SGLang/vLLM `--kv-cache-dtype auto` (BF16) cache instead of the inferred FP8 one, set
+`engine.workers.<role>.kv_cache.dtype: bfloat16`, which pins both `--kvcache-quant-mode` and
+`--fmha-quant-mode` to BF16 for that role. The static estimate and source
 breakdown above remain compatibility features; see [advanced AIC tuning](../../python/aisimulate/docs/advanced_tuning.md).
 
 <a id="exact-cached-prefix-estimates"></a>

@@ -19,6 +19,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..config.common import pinned_kv_cache_quant_modes
 from .afd_parallel import (
     AFDInfeasible,
     AFDParallelConfig,
@@ -209,14 +210,28 @@ def _runner_supports_parallel_config(
     )
 
 
-def _engine_memory_kwargs(search_space):
+def _engine_memory_kwargs(search_space, roles: dict[str, str]):
+    """Engine-wide controls plus the per-role ``kv_cache.dtype`` pin for the KV pre-filter.
+
+    ``roles`` maps each pre-filter role to the search-space role whose pin it
+    sizes (identity for agg/disagg; ``{"agg": role}`` when a P/D role is
+    enumerated on its own hardware). The pre-filter must admit shapes with the
+    same KV dtype the candidate is later evaluated with, and pinning must keep
+    the inferred-FP8 warning silent here as well.
+    """
     model_controls = {
         name: getattr(search_space, name)
         for name in ENGINE_MODEL_CONTROL_FIELDS
         if getattr(search_space, name) not in (None, False)
     }
+    role_model_controls = {
+        prefilter_role: pinned
+        for prefilter_role, role in roles.items()
+        if (pinned := pinned_kv_cache_quant_modes(getattr(search_space, f"{role}_kv_cache_dtype")))
+    }
     return {
         **({"model_controls": model_controls} if model_controls else {}),
+        **({"role_model_controls": role_model_controls} if role_model_controls else {}),
         **({"nextn": search_space.aic_nextn} if search_space.aic_nextn else {}),
     }
 
@@ -290,7 +305,7 @@ def _heterogeneous_disagg_configs(
                 min_gpu_budget=None,
                 max_seq_len=max_seq_len,
                 role_runtime={"agg": _role_runtime(search_space, backend, role)},
-                **_engine_memory_kwargs(search_space),
+                **_engine_memory_kwargs(search_space, {"agg": role}),
                 **_estimator_root_kwargs(search_space, role),
             )
         except (NoPerfDatabase, NoViableParallelConfig) as exc:
@@ -618,7 +633,10 @@ def enumerate_branches(
                         min_gpu_budget=ss.min_gpu_budget,
                         max_seq_len=max_seq_len,
                         role_runtime=_runtime_by_role(ss, backend, deployment_mode),
-                        **_engine_memory_kwargs(ss),
+                        **_engine_memory_kwargs(
+                            ss,
+                            {"agg": "agg"} if deployment_mode == "agg" else {"prefill": "prefill", "decode": "decode"},
+                        ),
                         **_estimator_root_kwargs(ss, "agg" if deployment_mode == "agg" else "prefill"),
                     )
             except (NoPerfDatabase, NoViableParallelConfig):

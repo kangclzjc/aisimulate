@@ -49,6 +49,7 @@ from aisimulate_core.sdk.models.helpers import (
     resolve_nvfp4_for_system,
     resolve_sglang_mla_compute,
     resolve_vllm_moe_execution_mode,
+    warn_inferred_fp8_kv_cache,
 )
 
 # Auto-import every other module in this package so ``@register_model``
@@ -271,4 +272,5 @@ __all__ = [
     "resolve_nvfp4_for_system",
     "resolve_sglang_mla_compute",
     "resolve_vllm_moe_execution_mode",
+    "warn_inferred_fp8_kv_cache",
 ]

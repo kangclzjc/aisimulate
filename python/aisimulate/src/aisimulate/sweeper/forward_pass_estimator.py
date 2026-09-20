@@ -14,6 +14,7 @@ from aisimulate_core.sdk import (
     RustForwardPassPerfModel,
 )
 
+from ..config.common import pinned_kv_cache_quant_modes
 from .config import ENGINE_MODEL_CONTROL_FIELDS, SearchSpace
 from .deploy import _role_hardware_sku
 from .replay import ForwardPassEstimatorSpec
@@ -67,6 +68,8 @@ class ForwardPassEstimatorResolver:
         nextn = sample.get("aic_nextn")
         if nextn is None:
             nextn = self._search_space.aic_nextn
+        model_controls = {name: getattr(self._search_space, name) for name in ENGINE_MODEL_CONTROL_FIELDS}
+        model_controls.update(pinned_kv_cache_quant_modes(str(sample.get(f"{role}_kv_cache_dtype") or "auto")))
         return ForwardPassPerfModelConfig(
             model=self._search_space.model_name,
             system=_role_hardware_sku(sample, role),
@@ -79,7 +82,7 @@ class ForwardPassEstimatorResolver:
             moe_tp_size=moe_tp if moe_tp * moe_ep > 1 else None,
             moe_ep_size=moe_ep if moe_tp * moe_ep > 1 else None,
             nextn=int(nextn or 0),
-            **{name: getattr(self._search_space, name) for name in ENGINE_MODEL_CONTROL_FIELDS},
+            **model_controls,
             speculation=self._search_space.speculation.cost_config()
             if self._search_space.speculation is not None
             else None,

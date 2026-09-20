@@ -27,7 +27,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
-from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
+from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, KvCacheDtype, is_active_engine_model_control
 from ..config.engine import NgramSpeculationConfig
 
 
@@ -565,6 +565,7 @@ class SearchSpace(BaseModel):
     prefill_block_size: int | list[int] | None = 64
     prefill_gpu_memory_utilization: float | list[float] | None = 0.9
     prefill_enable_prefix_caching: bool = True
+    prefill_kv_cache_dtype: KvCacheDtype = "auto"
     prefill_kv_bytes_per_token: int | str = "auto"
     prefill_native_host_offload: dict[str, Any] | None = None
     prefill_num_gpu_blocks: int | None = None
@@ -579,6 +580,7 @@ class SearchSpace(BaseModel):
     decode_block_size: int | list[int] | None = 64
     decode_gpu_memory_utilization: float | list[float] | None = 0.9
     decode_enable_prefix_caching: bool = False  # forced off for decode workers
+    decode_kv_cache_dtype: KvCacheDtype = "auto"
     decode_kv_bytes_per_token: int | str = "auto"
     decode_native_host_offload: dict[str, Any] | None = None
     decode_num_gpu_blocks: int | None = None
@@ -593,6 +595,7 @@ class SearchSpace(BaseModel):
     agg_block_size: int | list[int] | None = 64
     agg_gpu_memory_utilization: float | list[float] | None = 0.9
     agg_enable_prefix_caching: bool = True
+    agg_kv_cache_dtype: KvCacheDtype = "auto"
     agg_kv_bytes_per_token: int | str = "auto"
     agg_native_host_offload: dict[str, Any] | None = None
     agg_num_gpu_blocks: int | None = None
@@ -918,8 +921,17 @@ class SearchSpace(BaseModel):
             raise ValueError("aic_nextn requires explicit nextn_accepted")
         if self.nextn_accepted is not None and (not self.aic_nextn or self.nextn_accepted > self.aic_nextn):
             raise ValueError("nextn_accepted requires aic_nextn > 0 and must be within [0, aic_nextn]")
-        active = self.aic_nextn or any(
-            is_active_engine_model_control(name, getattr(self, name)) for name in ENGINE_MODEL_CONTROL_FIELDS
+        pinned_kv_dtype = any(
+            getattr(self, f"{role}_kv_cache_dtype") != "auto" for role in ("agg", "prefill", "decode")
+        )
+        if pinned_kv_dtype and (self.kvcache_quant_mode is not None or self.fmha_quant_mode is not None):
+            raise ValueError("kv_cache_dtype conflicts with kvcache_quant_mode/fmha_quant_mode; set only one of them")
+        if len({self.prefill_kv_cache_dtype, self.decode_kv_cache_dtype} - {"auto"}) > 1:
+            raise ValueError("prefill_kv_cache_dtype and decode_kv_cache_dtype must match (or stay auto on one side)")
+        active = (
+            self.aic_nextn
+            or pinned_kv_dtype
+            or any(is_active_engine_model_control(name, getattr(self, name)) for name in ENGINE_MODEL_CONTROL_FIELDS)
         )
         if active and (
             self.encoder is not None

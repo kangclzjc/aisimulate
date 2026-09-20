@@ -10,7 +10,12 @@ from copy import deepcopy
 from typing import Any
 
 from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_blocks
-from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control, omit_inactive_moe_controls
+from ..config.common import (
+    ENGINE_MODEL_CONTROL_FIELDS,
+    is_active_engine_model_control,
+    omit_inactive_moe_controls,
+    pinned_kv_cache_quant_modes,
+)
 from ..config.engine import NgramSpeculationConfig
 from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimatorSpec
 
@@ -25,6 +30,12 @@ def _role_hardware_sku(sample: dict[str, Any], role: str) -> str:
     if role in {"prefill", "decode"}:
         return str(sample.get(f"{role}_hardware_sku") or sample["hardware_sku"])
     return str(sample["hardware_sku"])
+
+
+def _sample_kvcache_quant_mode(sample: dict[str, Any], role: str) -> str | None:
+    """Role-pinned ``kv_cache.dtype`` wins over the engine-wide mode for KV geometry."""
+    pinned = pinned_kv_cache_quant_modes(str(sample.get(f"{role}_kv_cache_dtype") or "auto"))
+    return pinned.get("kvcache_quant_mode") or sample.get("kvcache_quant_mode")
 
 
 def _performance_model_metadata(sample: dict[str, Any], role: str, *, backend_version: str) -> dict[str, Any]:
@@ -61,9 +72,11 @@ def _engine_args_payload(
     forward_pass_estimator: ForwardPassEstimatorSpec | None = None,
 ) -> dict[str, Any]:
     """Build the runner-neutral engine argument payload for one role."""
-    if any(is_active_engine_model_control(name, sample.get(name)) for name in ENGINE_MODEL_CONTROL_FIELDS) and (
-        forward_pass_estimator is None or sample.get(f"{role}_timing_model") is not None
-    ):
+    pinned_kv_dtype = str(sample.get(f"{role}_kv_cache_dtype") or "auto") != "auto"
+    if (
+        pinned_kv_dtype
+        or any(is_active_engine_model_control(name, sample.get(name)) for name in ENGINE_MODEL_CONTROL_FIELDS)
+    ) and (forward_pass_estimator is None or sample.get(f"{role}_timing_model") is not None):
         raise ValueError("engine model controls require a resolved canonical forward-pass estimator for every role")
     prefix = _role_prefix(role)
     tp = int(sample[f"{prefix}tp"])
@@ -153,6 +166,7 @@ def _engine_args_payload(
     host_offload = sample.get(f"{role}_native_host_offload")
     if host_offload is not None:
         configured_bytes = sample[f"{role}_kv_bytes_per_token"]
+        kv_mode = _sample_kvcache_quant_mode(sample, role)
         payload["kv_cache_bytes_per_token"] = (
             estimate_kv_bytes_per_token(
                 str(sample["model_name"]),
@@ -160,13 +174,14 @@ def _engine_args_payload(
                 pp_size=int(sample[f"{prefix}pp"]),
                 moe_tp_size=moe_tp,
                 moe_ep_size=moe_ep,
-                **({"kvcache_quant_mode": sample["kvcache_quant_mode"]} if sample.get("kvcache_quant_mode") else {}),
+                **({"kvcache_quant_mode": kv_mode} if kv_mode else {}),
             )
             if configured_bytes == "auto"
             else int(configured_bytes)
         )
     transfer_geometry = sample.get("kv_transfer_bytes_per_token")
     if role in {"prefill", "decode"} and transfer_geometry is not None:
+        transfer_kv_mode = _sample_kvcache_quant_mode(sample, "prefill")
         payload["kv_transfer_bytes_per_token"] = (
             estimate_kv_bytes_per_token(
                 str(sample["model_name"]),
@@ -174,7 +189,7 @@ def _engine_args_payload(
                 pp_size=int(sample["prefill_pp"]),
                 moe_tp_size=int(sample["prefill_moe_tp"]),
                 moe_ep_size=int(sample["prefill_moe_ep"]),
-                **({"kvcache_quant_mode": sample["kvcache_quant_mode"]} if sample.get("kvcache_quant_mode") else {}),
+                **({"kvcache_quant_mode": transfer_kv_mode} if transfer_kv_mode else {}),
             )
             if transfer_geometry == "auto"
             else int(transfer_geometry)
