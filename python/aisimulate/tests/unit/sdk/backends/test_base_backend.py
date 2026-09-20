@@ -923,6 +923,81 @@ def test_run_agg_cache_separates_video_workloads(
     assert len(backend._agg_cache) == 2
 
 
+def test_run_agg_cache_separates_prefix_on_a_reused_backend(
+    monkeypatch,
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    """Two calls differing only in prefix must not share a cached summary."""
+    mixed_calls: list[int] = []
+
+    def _run_mixed(*args, **kwargs):
+        prefix = args[2].prefix
+        mixed_calls.append(prefix)
+        # Make the answer depend on prefix so a stale hit is observable.
+        return StepEstimate(latency_ms=10.0 - prefix, energy_wms=100.0)
+
+    monkeypatch.setattr(backend, "run_mixed", _run_mixed)
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *args, **kwargs: _decode_step(1.0, 1.0, {}, {}, ()),
+    )
+
+    common_kwargs = dict(batch_size=2, beam_width=1, isl=8, osl=5, engine_step_backend="rust")
+    no_prefix = backend.run_agg(model, database, RuntimeConfig(**common_kwargs, prefix=0), ctx_tokens=8)
+    with_prefix = backend.run_agg(model, database, RuntimeConfig(**common_kwargs, prefix=4), ctx_tokens=8)
+
+    assert mixed_calls == [0, 4]
+    assert len(backend._agg_cache) == 2
+    assert no_prefix is not with_prefix
+    assert no_prefix.get_result_dict()["prefix"] == 0
+    assert with_prefix.get_result_dict()["prefix"] == 4
+    assert no_prefix.get_result_dict()["ttft"] != with_prefix.get_result_dict()["ttft"]
+
+    # An identical request still hits the cache without re-estimating.
+    repeat = backend.run_agg(model, database, RuntimeConfig(**common_kwargs, prefix=4), ctx_tokens=8)
+    assert repeat is with_prefix
+    assert mixed_calls == [0, 4]
+    assert len(backend._agg_cache) == 2
+
+    # prefix=None normalizes like run_mixed (int(prefix or 0)): it shares the
+    # prefix=0 entry and echoes 0, not None.
+    assert backend.run_agg(model, database, RuntimeConfig(**common_kwargs, prefix=None), ctx_tokens=8) is no_prefix
+    assert mixed_calls == [0, 4]
+    assert len(backend._agg_cache) == 2
+
+
+@pytest.mark.parametrize("field", ["seq_imbalance_correction_scale", "gen_seq_imbalance_correction_scale"])
+def test_run_agg_cache_separates_seq_imbalance_correction_scales(
+    monkeypatch,
+    backend: BaseBackend,
+    model,
+    database,
+    field: str,
+) -> None:
+    seen: list[float] = []
+
+    def _run_mixed(*args, **kwargs):
+        seen.append(getattr(args[2], field))
+        return StepEstimate(latency_ms=1.0, energy_wms=1.0)
+
+    monkeypatch.setattr(backend, "run_mixed", _run_mixed)
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *args, **kwargs: _decode_step(1.0, 1.0, {}, {}, ()),
+    )
+
+    common_kwargs = dict(batch_size=2, beam_width=1, isl=8, osl=5, engine_step_backend="rust")
+    backend.run_agg(model, database, RuntimeConfig(**common_kwargs, **{field: 1.0}), ctx_tokens=8)
+    backend.run_agg(model, database, RuntimeConfig(**common_kwargs, **{field: 1.5}), ctx_tokens=8)
+
+    assert seen == [1.0, 1.5]
+    assert len(backend._agg_cache) == 2
+
+
 @pytest.mark.parametrize(
     ("engine_step_backend", "error", "match"),
     [
