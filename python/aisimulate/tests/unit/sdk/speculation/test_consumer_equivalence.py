@@ -639,13 +639,31 @@ def test_mixed_draft_native_phases_match_independent_queries(real_database, ctx_
     assert not any(row[0].startswith("draft_") for row in shared)
     ctx_indices = [i for i, op in enumerate(model.context_ops) if op._name.startswith("draft_")]
     gen_indices = [i for i, op in enumerate(model.generation_ops) if op._name.startswith("draft_")]
-    # ctx_tokens budgets UNCACHED tokens: requests pack by isl - prefix.
+    # ctx_tokens budgets UNCACHED tokens: requests pack by isl - prefix. A
+    # prefix>0 budget that is not a multiple of isl_new is priced as the fill
+    # fraction of one more batched request (mirror of the engine's
+    # `context_attention_groups`: (complete, 1 - fill) + (complete + 1, fill)).
     isl_new = 4000 - prefix
-    expected_context = (
-        handle.evaluate_context_ops(ctx_indices, batch_size=math.ceil(ctx_tokens / isl_new), s=isl_new, prefix=prefix)
-        if ctx_tokens
-        else []
-    )
+
+    def _context_groups(ctx: int, new: int) -> list[tuple[int, float]]:
+        complete, partial = divmod(ctx, new)
+        if prefix == 0 or complete == 0 or partial == 0:
+            return [(math.ceil(ctx / new), 1.0)]
+        fill = partial / new
+        return [(complete, 1.0 - fill), (complete + 1, fill)]
+
+    expected_context = []
+    if ctx_tokens:
+        groups = _context_groups(ctx_tokens, isl_new)
+        per_group = [
+            handle.evaluate_context_ops(ctx_indices, batch_size=batch, s=isl_new, prefix=prefix) for batch, _ in groups
+        ]
+        for rows in zip(*per_group, strict=True):
+            assert len({row[0] for row in rows}) == 1
+            latency = sum(weight * row[1] for (_, weight), row in zip(groups, rows, strict=True))
+            energy = sum(weight * row[2] for (_, weight), row in zip(groups, rows, strict=True))
+            sources = {row[3] for row in rows}
+            expected_context.append((rows[0][0], latency, energy, sources.pop() if len(sources) == 1 else "mixed"))
     expected_generation = (
         handle.evaluate_generation_ops(gen_indices, batch_size=gen_requests * 4, s=4033) if gen_requests else []
     )
