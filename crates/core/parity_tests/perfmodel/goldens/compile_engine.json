@@ -16,7 +16,7 @@
   "post_freeze_pins": {
     "chunked_prefill::ctx300_gen7_isl1000_osl64_prefix100::mixed_step": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "chunked_prefill::ctx512_gen4_isl4096_osl128_prefix0::mixed_step": {
       "engine": "rust",
@@ -128,7 +128,7 @@
     },
     "minimax-m25-b200-vllm-sampled-prefix::mixed_step": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "minimax-m25-b200-vllm-sampled-prefix::static_ctx": {
       "engine": "rust",
@@ -228,7 +228,7 @@
     }
   },
   "references": {
-    "chunked_prefill::ctx300_gen7_isl1000_osl64_prefix100::mixed_step": 16.081171352808852,
+    "chunked_prefill::ctx300_gen7_isl1000_osl64_prefix100::mixed_step": 16.414675748089216,
     "chunked_prefill::ctx512_gen4_isl4096_osl128_prefix0::mixed_step": 17.664446149246828,
     "chunked_prefill::ctx512_gen4_isl4096_osl128_prefix256::mixed_step": 17.662495086777085,
     "gpt-oss-20b-b200-trtllm-isl1024-osl2::decode_step": 2.213361158220323,
@@ -256,7 +256,7 @@
     "minimax-m25-b200-vllm-isl1024-osl2::static_ctx": 21.898890264920386,
     "minimax-m25-b200-vllm-isl1024-osl2::static_gen": 6.956580007206089,
     "minimax-m25-b200-vllm-sampled-prefix::decode_step": 7.81648403057622,
-    "minimax-m25-b200-vllm-sampled-prefix::mixed_step": 33.61569835698758,
+    "minimax-m25-b200-vllm-sampled-prefix::mixed_step": 35.868461622365196,
     "minimax-m25-b200-vllm-sampled-prefix::static_ctx": 48.247495936383125,
     "minimax-m25-b200-vllm-sampled-prefix::static_gen": 31.26586491919031,
     "minimax-m27-b200-vllm-isl1024-osl2::decode_step": 6.956592859289543,

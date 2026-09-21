@@ -59,9 +59,9 @@
     "deepseek-v3-b200-vllm-shape-prefix-heavy": {
       "agg": {
         "values": {
-          "agg_request": 358.3741439734639,
-          "agg_tpot": 16.048116334702787,
-          "agg_ttft": 117.65239895292213
+          "agg_request": 381.95759294796125,
+          "agg_tpot": 15.214774335613736,
+          "agg_ttft": 153.7359779137552
         }
       },
       "disagg": {
@@ -73,7 +73,7 @@
       },
       "mixed": {
         "values": {
-          "mixed_step": 55.779910180375225
+          "mixed_step": 87.85420259000462
         }
       },
       "static": {
@@ -704,9 +704,9 @@
     "minimax-m25-b200-vllm-sampled-prefix": {
       "agg": {
         "values": {
-          "agg_request": 166.24926626789278,
-          "agg_tpot": 18.148929624879287,
-          "agg_ttft": 93.65354776837562
+          "agg_request": 172.38732608016997,
+          "agg_tpot": 19.049929230351168,
+          "agg_ttft": 96.1876091587653
         }
       },
       "disagg": {
@@ -718,7 +718,7 @@
       },
       "mixed": {
         "values": {
-          "mixed_step": 33.61569835698758
+          "mixed_step": 35.868461622365196
         }
       },
       "static": {
@@ -1875,7 +1875,7 @@
     },
     "deepseek-v3-b200-vllm-shape-prefix-heavy::agg": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "deepseek-v3-b200-vllm-shape-prefix-heavy::disagg": {
       "engine": "rust",
@@ -1883,7 +1883,7 @@
     },
     "deepseek-v3-b200-vllm-shape-prefix-heavy::mixed": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "deepseek-v3-b200-vllm-shape-prefix-heavy::static": {
       "engine": "rust",
@@ -2263,7 +2263,7 @@
     },
     "minimax-m25-b200-vllm-sampled-prefix::agg": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "minimax-m25-b200-vllm-sampled-prefix::disagg": {
       "engine": "rust",
@@ -2271,7 +2271,7 @@
     },
     "minimax-m25-b200-vllm-sampled-prefix::mixed": {
       "engine": "rust",
-      "git_head": "0a51476b6ab90bc0e475bd41d4b1c7abbef07b95"
+      "git_head": "345d9df976a3b9bbe7b93f4dbc54f2030f6003c2"
     },
     "minimax-m25-b200-vllm-sampled-prefix::static": {
       "engine": "rust",
